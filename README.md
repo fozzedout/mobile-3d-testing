@@ -50,6 +50,13 @@ npx wrangler login   # first time only
 npm run deploy        # builds, then runs `wrangler deploy`
 ```
 
+`wrangler.jsonc` also sets `build.command: "npm run build"`, so `wrangler
+deploy` runs the Vite build itself before uploading `dist/`. That means if
+you connect this repo to a Worker via Cloudflare's Git integration (Workers
+Builds), you don't need to configure a Build command in the dashboard at
+all — leave it as whatever it defaults to and just make sure the Deploy
+command is `npx wrangler deploy`; wrangler builds fresh on every deploy.
+
 `wrangler.jsonc` sets `name: "mobile-3d-testing"`; change it if you want a
 different Workers subdomain (`<name>.<your-subdomain>.workers.dev`), or wire
 up a custom domain/route in the Cloudflare dashboard afterwards.
