@@ -21,6 +21,7 @@ export class CompassHUD {
   private readonly diameter: number;
   private readonly width: number;
   private readonly height: number;
+  private readonly prevDeviation = new Map<string, number>();
 
   constructor(diameter = 120) {
     this.diameter = diameter;
@@ -42,7 +43,7 @@ export class CompassHUD {
     this.ctx.scale(ratio, ratio);
   }
 
-  update(camera: THREE.Camera, targets: CompassTarget[]): void {
+  update(camera: THREE.Camera, targets: CompassTarget[], delta = 0): void {
     const { ctx, width, diameter } = this;
     const cx = width / 2;
     const cy = diameter / 2;
@@ -69,7 +70,7 @@ export class CompassHUD {
 
     camera.updateMatrixWorld();
     const inverse = camera.matrixWorldInverse;
-    const labels: { text: string; color: string }[] = [];
+    const labels: { text: string; color: string; rateText: string; rateColor: string }[] = [];
 
     for (const target of targets) {
       const camSpace = target.position.clone().applyMatrix4(inverse);
@@ -98,14 +99,44 @@ export class CompassHUD {
       }
       ctx.globalAlpha = 1;
 
-      labels.push({ text: `${target.label} ${Math.round(distance)}m`, color: target.color });
+      // Closing-rate cue: how fast this target's bearing is converging on
+      // dead-ahead, so you can anticipate an overshoot before it happens
+      // rather than only noticing after you've already sailed past it.
+      const deviationDeg = THREE.MathUtils.radToDeg(deviation);
+      let rateText = "";
+      let rateColor = "rgba(154,162,177,0.7)";
+      const prevDeg = this.prevDeviation.get(target.label);
+      if (prevDeg !== undefined && delta > 0) {
+        const closingRate = (prevDeg - deviationDeg) / delta; // deg/sec, positive = converging on boresight
+        const magnitude = Math.round(Math.abs(closingRate));
+        if (closingRate > 60) {
+          rateColor = "#ff6b6b";
+          rateText = ` ▼▼${magnitude}°/s`;
+        } else if (closingRate > 15) {
+          rateColor = "#8fe3a0";
+          rateText = ` ▼${magnitude}°/s`;
+        } else if (closingRate < -15) {
+          rateText = ` ▲${magnitude}°/s`;
+        }
+      }
+      this.prevDeviation.set(target.label, deviationDeg);
+
+      labels.push({ text: `${target.label} ${Math.round(distance)}m`, color: target.color, rateText, rateColor });
     }
 
     ctx.font = "11px system-ui, sans-serif";
-    ctx.textAlign = "center";
+    ctx.textAlign = "left";
     labels.forEach((l, i) => {
+      const y = diameter + 14 + i * 14;
+      const mainWidth = ctx.measureText(l.text).width;
+      const rateWidth = l.rateText ? ctx.measureText(l.rateText).width : 0;
+      const startX = cx - (mainWidth + rateWidth) / 2;
       ctx.fillStyle = l.color;
-      ctx.fillText(l.text, cx, diameter + 14 + i * 14);
+      ctx.fillText(l.text, startX, y);
+      if (l.rateText) {
+        ctx.fillStyle = l.rateColor;
+        ctx.fillText(l.rateText, startX + mainWidth, y);
+      }
     });
   }
 

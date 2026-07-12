@@ -8,6 +8,13 @@ import { orientationToQuaternion, requestMotionPermission } from "../core/device
 const DEFAULT_MAX_SPEED = 60;
 const DEFAULT_LOOK_RATE = 90; // deg/sec at full stick deflection
 
+// Time-based rate/position hybrid: a look-stick touch shorter than this
+// (in time AND distance) is treated as a precise position-control flick;
+// crossing either threshold promotes it to ongoing rate control.
+const FLICK_TIME_MS = 220;
+const FLICK_DIST_PX = 38;
+const FLICK_MAX_ANGLE = THREE.MathUtils.degToRad(10);
+
 type Scheme = "dual-stick" | "gyro-move";
 
 function buildStarfield(): THREE.Points {
@@ -77,8 +84,10 @@ function setup(ctx: SceneContext): SceneInstance {
   const shipPosition = new THREE.Vector3(0, 0, 0);
   const shipQuaternion = new THREE.Quaternion();
   const velocity = new THREE.Vector3();
+  const angularVelocity = { yaw: 0, pitch: 0 }; // rad/sec, local frame — used when rotationalInertia is on
   const gyroQuaternion = new THREE.Quaternion();
   let haveGyro = false;
+  let gyroTrimPrev: THREE.Quaternion | null = null;
   let pendingRoll = 0;
 
   camera.position.copy(shipPosition);
@@ -94,6 +103,10 @@ function setup(ctx: SceneContext): SceneInstance {
     audioFeedback: true,
     motionStatus: "tap Enable motion",
     speed: 0,
+    gyroTrim: false,
+    gyroTrimStrength: 0.25,
+    precisionFlick: true,
+    rotationalInertia: false,
   };
 
   const moveStick = new VirtualJoystick(document.body, { color: "#8fe3a0", audio });
@@ -131,6 +144,11 @@ function setup(ctx: SceneContext): SceneInstance {
   let moveOrigin = { x: 0, y: 0 };
   let lookTouchId: number | null = null;
   let lookOrigin = { x: 0, y: 0 };
+  let lastLookDx = 0;
+  let lastLookDy = 0;
+  let lookTouchStartTime = 0;
+  let lookMode: "position" | "rate" = "rate";
+  const lookBaseQuaternion = new THREE.Quaternion();
   let rollTouchId: number | null = null;
   let rollPrevAngle = 0;
 
@@ -141,11 +159,16 @@ function setup(ctx: SceneContext): SceneInstance {
     moveTouchId = null;
     lookTouchId = null;
     rollTouchId = null;
+    gyroTrimPrev = null;
   }
 
   gui.add(params, "scheme", ["dual-stick", "gyro-move"]).name("Control scheme").onChange(resetTouchState);
-  gui.add({ enableMotion }, "enableMotion").name("Enable motion (gyro-move)");
+  gui.add({ enableMotion }, "enableMotion").name("Enable motion");
   gui.add(params, "motionStatus").name("Motion status").listen().disable();
+  gui.add(params, "gyroTrim").name("Gyro fine-trim (dual-stick)");
+  gui.add(params, "gyroTrimStrength", 0.05, 0.6, 0.05).name("Gyro trim strength");
+  gui.add(params, "precisionFlick").name("Precision flick mode");
+  gui.add(params, "rotationalInertia").name("Rotational inertia");
   gui.add(params, "maxSpeed", 10, 150, 5).name("Max speed");
   gui.add(params, "lookRate", 30, 180, 5).name("Look sensitivity");
   gui.add(params, "audioFeedback").name("Audio feedback").onChange((v: boolean) => {
@@ -182,6 +205,11 @@ function setup(ctx: SceneContext): SceneInstance {
       if (lookTouchId === null) {
         lookTouchId = e.pointerId;
         lookOrigin = { x: e.clientX, y: e.clientY };
+        lastLookDx = 0;
+        lastLookDy = 0;
+        lookTouchStartTime = performance.now();
+        lookMode = "position";
+        lookBaseQuaternion.copy(shipQuaternion);
         lookStick.show(e.clientX, e.clientY);
       } else if (rollTouchId === null) {
         rollTouchId = e.pointerId;
@@ -213,7 +241,9 @@ function setup(ctx: SceneContext): SceneInstance {
         rollPrevAngle = angle;
       }
     } else if (e.pointerId === lookTouchId) {
-      lookStick.feed(e.clientX - lookOrigin.x, e.clientY - lookOrigin.y);
+      lastLookDx = e.clientX - lookOrigin.x;
+      lastLookDy = e.clientY - lookOrigin.y;
+      lookStick.feed(lastLookDx, lastLookDy);
     }
   }
 
@@ -250,11 +280,70 @@ function setup(ctx: SceneContext): SceneInstance {
 
       if (params.scheme === "gyro-move") {
         if (haveGyro) shipQuaternion.slerp(gyroQuaternion, Math.min(1, delta * 6));
+        angularVelocity.yaw = 0;
+        angularVelocity.pitch = 0;
       } else {
-        const yaw = -lookStick.value.x * lookRateRad * delta;
-        const pitch = -lookStick.value.y * lookRateRad * delta;
-        const lookDelta = new THREE.Quaternion().setFromEuler(new THREE.Euler(pitch, yaw, 0, "YXZ"));
-        shipQuaternion.multiply(lookDelta);
+        // Time-based rate/position hybrid: a fresh look-stick touch starts in
+        // "position" mode (finger offset maps directly to a small, precise
+        // absolute look angle, no momentum) and promotes to ongoing rate
+        // control once it's held past a time or distance threshold.
+        let handledByFlick = false;
+        if (params.precisionFlick && lookTouchId !== null) {
+          if (lookMode === "position") {
+            const held = performance.now() - lookTouchStartTime;
+            const dist = Math.hypot(lastLookDx, lastLookDy);
+            if (held < FLICK_TIME_MS && dist < FLICK_DIST_PX) {
+              const posYaw = -THREE.MathUtils.clamp(lastLookDx / FLICK_DIST_PX, -1, 1) * FLICK_MAX_ANGLE;
+              const posPitch = -THREE.MathUtils.clamp(lastLookDy / FLICK_DIST_PX, -1, 1) * FLICK_MAX_ANGLE;
+              const offset = new THREE.Quaternion().setFromEuler(new THREE.Euler(posPitch, posYaw, 0, "YXZ"));
+              shipQuaternion.copy(lookBaseQuaternion).multiply(offset);
+              angularVelocity.yaw = 0;
+              angularVelocity.pitch = 0;
+              handledByFlick = true;
+            } else {
+              lookMode = "rate"; // promoted — falls through to rate control below, continuing from here
+            }
+          }
+        }
+
+        if (!handledByFlick) {
+          const targetYawRate = -lookStick.value.x * lookRateRad;
+          const targetPitchRate = -lookStick.value.y * lookRateRad;
+
+          if (params.rotationalInertia) {
+            const stickActive = Math.hypot(lookStick.value.x, lookStick.value.y) > 0.02;
+            // Moderate smoothing while steering; a much faster decay the instant
+            // the stick is released, so "let go" reliably means "stopped soon"
+            // rather than coasting on unpredictably for a while.
+            const timeConstant = stickActive ? 0.12 : 0.05;
+            const factor = 1 - Math.exp(-delta / timeConstant);
+            angularVelocity.yaw = THREE.MathUtils.lerp(angularVelocity.yaw, targetYawRate, factor);
+            angularVelocity.pitch = THREE.MathUtils.lerp(angularVelocity.pitch, targetPitchRate, factor);
+          } else {
+            angularVelocity.yaw = targetYawRate;
+            angularVelocity.pitch = targetPitchRate;
+          }
+
+          const lookDelta = new THREE.Quaternion().setFromEuler(
+            new THREE.Euler(angularVelocity.pitch * delta, angularVelocity.yaw * delta, 0, "YXZ"),
+          );
+          shipQuaternion.multiply(lookDelta);
+        }
+
+        // Gyro fine-trim: adds the device's relative tilt since last frame as a
+        // small additive nudge on top of stick-driven look, rather than
+        // replacing it outright (avoids the "absolute mapping" finickiness of
+        // the gyro-move scheme while still giving fine-aim assistance).
+        if (params.gyroTrim && haveGyro) {
+          if (gyroTrimPrev) {
+            const trimDelta = gyroTrimPrev.clone().invert().multiply(gyroQuaternion);
+            const scaled = new THREE.Quaternion().identity().slerp(trimDelta, params.gyroTrimStrength);
+            shipQuaternion.multiply(scaled);
+          }
+          gyroTrimPrev = gyroQuaternion.clone();
+        } else {
+          gyroTrimPrev = null;
+        }
       }
 
       if (pendingRoll !== 0) {
@@ -277,7 +366,7 @@ function setup(ctx: SceneContext): SceneInstance {
       camera.quaternion.copy(shipQuaternion);
       shipLight.position.copy(shipPosition);
 
-      compass.update(camera, targets);
+      compass.update(camera, targets, delta);
     },
     dispose() {
       canvas.removeEventListener("pointerdown", onPointerDown);
