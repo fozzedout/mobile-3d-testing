@@ -1,29 +1,6 @@
 import * as THREE from "three";
 import type { SceneContext, SceneInstance, TestScene } from "./types.ts";
-
-interface OrientationCapableEvent {
-  requestPermission?: () => Promise<"granted" | "denied">;
-}
-
-/** Reproduces the standard device-orientation → world quaternion mapping (screen-orientation aware). */
-function orientationToQuaternion(
-  alpha: number,
-  beta: number,
-  gamma: number,
-  screenAngle: number,
-  target: THREE.Quaternion,
-): THREE.Quaternion {
-  const euler = new THREE.Euler();
-  const q0 = new THREE.Quaternion();
-  const q1 = new THREE.Quaternion(-Math.sqrt(0.5), 0, 0, Math.sqrt(0.5));
-  const zee = new THREE.Vector3(0, 0, 1);
-
-  euler.set(THREE.MathUtils.degToRad(beta), THREE.MathUtils.degToRad(alpha), THREE.MathUtils.degToRad(-gamma), "YXZ");
-  target.setFromEuler(euler);
-  target.multiply(q1);
-  target.multiply(q0.setFromAxisAngle(zee, -screenAngle));
-  return target;
-}
+import { orientationToQuaternion, requestMotionPermission } from "../core/device-orientation.ts";
 
 function setup({ scene, gui, canvas }: SceneContext): SceneInstance {
   const readout = { alpha: 0, beta: 0, gamma: 0, motion: "tap Enable motion" };
@@ -60,20 +37,17 @@ function setup({ scene, gui, canvas }: SceneContext): SceneInstance {
   }
 
   async function enableMotion(): Promise<void> {
-    const DOE = DeviceOrientationEvent as unknown as OrientationCapableEvent;
-    try {
-      if (typeof DOE.requestPermission === "function") {
-        const result = await DOE.requestPermission();
-        if (result !== "granted") {
-          readout.motion = "permission denied";
-          return;
-        }
-      }
-      window.addEventListener("deviceorientation", handleOrientation);
-      readout.motion = "listening";
-    } catch {
+    const result = await requestMotionPermission();
+    if (result === "unsupported") {
       readout.motion = "unsupported on this device";
+      return;
     }
+    if (result === "denied") {
+      readout.motion = "permission denied";
+      return;
+    }
+    window.addEventListener("deviceorientation", handleOrientation);
+    readout.motion = "listening";
   }
 
   gui.add({ enableMotion }, "enableMotion").name("Enable motion");

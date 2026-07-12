@@ -99,7 +99,7 @@ canvas.addEventListener("drop", (e) => {
 ticker.add((delta, elapsed) => {
   fps.beginFrame();
   active?.update?.(delta, elapsed);
-  rendererCtx.controls.update();
+  if (!active?.manualCamera) rendererCtx.controls.update();
   rendererCtx.render(scene);
   fps.endFrame();
 });

@@ -10,6 +10,7 @@ GPU limits, and battery-friendly rendering.
 - **Particle Stress Test** — a point cloud with an adjustable count, for finding where a device's GPU starts to struggle.
 - **Touch & Gyro** — visualizes raw multi-touch points and `deviceorientation` sensor data (with the iOS motion-permission prompt wired up).
 - **Load Model (GLTF)** — drag & drop a `.glb`/`.gltf` file to inspect it on-device (triangle/node counts, wireframe toggle).
+- **Space Sim (Touch Nav)** — a free-flight 6DOF lab: a cube and sphere placed far apart, found via an on-screen bearing compass. Built to A/B touch-navigation schemes: dual floating joysticks (rate-control translate + look, with a second finger on the look stick switching to a twist-to-roll gesture) vs. gyro-look + touch-thrust (device orientation for looking, one thumb for movement). Joysticks apply a logarithmic pseudo-haptic "wall" past their soft limit and synthesize click/thud audio as a Taptic Engine stand-in.
 
 Each scene is a self-contained module in `src/scenes/`; add a new one by
 creating a file that exports a `TestScene` (see `src/scenes/types.ts`) and

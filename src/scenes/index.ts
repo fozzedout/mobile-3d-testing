@@ -34,4 +34,10 @@ export const sceneRegistry: SceneMeta[] = [
     description: "Drag & drop a .glb/.gltf to inspect real assets on-device.",
     load: () => import("./model-loader.ts").then((m) => m.modelLoaderScene),
   },
+  {
+    id: "space-sim",
+    name: "Space Sim (Touch Nav)",
+    description: "6DOF flight lab with a compass HUD — a testbed for touch navigation schemes.",
+    load: () => import("./space-sim.ts").then((m) => m.spaceSimScene),
+  },
 ];

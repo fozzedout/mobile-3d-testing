@@ -16,6 +16,12 @@ export interface SceneInstance {
   dispose?(): void;
   /** Called when a file is dropped onto the canvas (e.g. a .glb/.gltf model). */
   onFileDrop?(file: File): void;
+  /**
+   * Set when the scene drives the camera itself (e.g. a free-flight rig).
+   * The app skips its own OrbitControls.update() call while true, since
+   * OrbitControls would otherwise fight the scene for camera.position.
+   */
+  manualCamera?: boolean;
 }
 
 export interface TestScene {
