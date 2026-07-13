@@ -74,6 +74,7 @@ export class FlightRig {
   private readonly rollSlider: EdgeSlider;
   private readonly guiResizeObserver: ResizeObserver;
   private guiEl: HTMLElement | null = null;
+  private readonly reticle: HTMLDivElement;
   private lookTouchId: number | null = null;
   private lookOrigin = { x: 0, y: 0 };
   private lastLookDx = 0;
@@ -96,6 +97,18 @@ export class FlightRig {
     this.verticalIndicator.textContent = "⇕";
     this.verticalIndicator.hidden = true;
     document.body.appendChild(this.verticalIndicator);
+
+    // A fixed center reticle — a stable reference for "dead ahead" while
+    // lining up a roll against a rotating target (or anything else).
+    this.reticle = document.createElement("div");
+    this.reticle.className = "flight-reticle";
+    this.reticle.innerHTML =
+      '<span class="reticle-line reticle-top"></span>' +
+      '<span class="reticle-line reticle-bottom"></span>' +
+      '<span class="reticle-line reticle-left"></span>' +
+      '<span class="reticle-line reticle-right"></span>' +
+      '<span class="reticle-dot"></span>';
+    document.body.appendChild(this.reticle);
 
     // Paired with the same hand as their "primary" stick, so both can be held
     // at once: vertical strafe sits with the move stick (left), roll sits
@@ -447,5 +460,6 @@ export class FlightRig {
     this.guiResizeObserver.disconnect();
     this.verticalSlider.dispose();
     this.rollSlider.dispose();
+    this.reticle.remove();
   }
 }

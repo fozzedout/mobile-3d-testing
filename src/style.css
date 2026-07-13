@@ -198,6 +198,68 @@ body {
   pointer-events: none;
 }
 
+.flight-reticle {
+  position: fixed;
+  top: 50%;
+  left: 50%;
+  width: 32px;
+  height: 32px;
+  transform: translate(-50%, -50%);
+  /* Above lil-gui's own z-index (1001) — the GUI panel often covers screen
+     center, and the reticle needs to stay visible even then. Harmless since
+     it's pointer-events:none and doesn't intercept GUI interaction. */
+  z-index: 1002;
+  pointer-events: none;
+}
+
+.flight-reticle .reticle-dot {
+  position: absolute;
+  top: 50%;
+  left: 50%;
+  width: 4px;
+  height: 4px;
+  border-radius: 50%;
+  background: rgba(238, 241, 246, 0.85);
+  transform: translate(-50%, -50%);
+}
+
+.flight-reticle .reticle-line {
+  position: absolute;
+  background: rgba(238, 241, 246, 0.65);
+}
+
+.flight-reticle .reticle-top,
+.flight-reticle .reticle-bottom {
+  left: 50%;
+  width: 2px;
+  height: 9px;
+  transform: translateX(-50%);
+}
+
+.flight-reticle .reticle-top {
+  top: 0;
+}
+
+.flight-reticle .reticle-bottom {
+  bottom: 0;
+}
+
+.flight-reticle .reticle-left,
+.flight-reticle .reticle-right {
+  top: 50%;
+  height: 2px;
+  width: 9px;
+  transform: translateY(-50%);
+}
+
+.flight-reticle .reticle-left {
+  left: 0;
+}
+
+.flight-reticle .reticle-right {
+  right: 0;
+}
+
 .edge-slider {
   position: fixed;
   top: 50%;
