@@ -107,6 +107,8 @@ function setup(ctx: SceneContext): SceneInstance {
     gyroTrimStrength: 0.25,
     precisionFlick: true,
     rotationalInertia: false,
+    inertiaRampMs: 120,
+    inertiaBrakeMs: 90,
   };
 
   const moveStick = new VirtualJoystick(document.body, { color: "#8fe3a0", audio });
@@ -169,6 +171,8 @@ function setup(ctx: SceneContext): SceneInstance {
   gui.add(params, "gyroTrimStrength", 0.05, 0.6, 0.05).name("Gyro trim strength");
   gui.add(params, "precisionFlick").name("Precision flick mode");
   gui.add(params, "rotationalInertia").name("Rotational inertia");
+  gui.add(params, "inertiaRampMs", 30, 400, 10).name("Inertia ramp-in (ms)");
+  gui.add(params, "inertiaBrakeMs", 30, 400, 10).name("Inertia brake (ms)");
   gui.add(params, "maxSpeed", 10, 150, 5).name("Max speed");
   gui.add(params, "lookRate", 30, 180, 5).name("Look sensitivity");
   gui.add(params, "audioFeedback").name("Audio feedback").onChange((v: boolean) => {
@@ -312,10 +316,10 @@ function setup(ctx: SceneContext): SceneInstance {
 
           if (params.rotationalInertia) {
             const stickActive = Math.hypot(lookStick.value.x, lookStick.value.y) > 0.02;
-            // Moderate smoothing while steering; a much faster decay the instant
-            // the stick is released, so "let go" reliably means "stopped soon"
-            // rather than coasting on unpredictably for a while.
-            const timeConstant = stickActive ? 0.12 : 0.05;
+            // Tunable smoothing while steering vs. decay the instant the stick
+            // is released — kept as separate sliders since "let go" should
+            // stay a fairly trustworthy stop signal even at gentler settings.
+            const timeConstant = (stickActive ? params.inertiaRampMs : params.inertiaBrakeMs) / 1000;
             const factor = 1 - Math.exp(-delta / timeConstant);
             angularVelocity.yaw = THREE.MathUtils.lerp(angularVelocity.yaw, targetYawRate, factor);
             angularVelocity.pitch = THREE.MathUtils.lerp(angularVelocity.pitch, targetPitchRate, factor);
