@@ -5,12 +5,14 @@ import { FlightRig } from "../core/flight-rig.ts";
 import { CourseTimer } from "../core/course-timer.ts";
 import { HitFlash } from "../core/hit-flash.ts";
 import { buildStarfield } from "../core/starfield.ts";
+import { crossedPlane } from "../core/plane-crossing.ts";
 
 const SHIP_RADIUS = 3;
 const BASE_ROCK_RADIUS = 4;
 const POOL_SIZE = 30;
 const COURSE_LENGTH = 600;
-const FINISH_RADIUS = 25;
+const GATE_RADIUS = 30;
+const GATE_PASS_RADIUS = GATE_RADIUS - SHIP_RADIUS;
 const HIT_PENALTY_MS = 1500;
 const INVULN_SECONDS = 0.6;
 const CORRIDOR_RADIUS = 55; // lateral spawn/despawn spread from the centerline
@@ -74,20 +76,34 @@ function setup(ctx: SceneContext): SceneInstance {
     a.mesh.position.z = -THREE.MathUtils.lerp(40, COURSE_LENGTH - 20, (i + Math.random()) / POOL_SIZE);
   });
 
+  const gateGeometry = new THREE.TorusGeometry(GATE_RADIUS, 2, 10, 40);
+  const gateMaterial = new THREE.MeshStandardMaterial({
+    color: "#8fe3a0",
+    emissive: "#1c5c33",
+    emissiveIntensity: 0.6,
+    roughness: 0.4,
+  });
+  const gateMesh = new THREE.Mesh(gateGeometry, gateMaterial);
+  const finishPosition = new THREE.Vector3(0, 0, -COURSE_LENGTH);
+  const gateNormal = new THREE.Vector3(0, 0, 1);
+  gateMesh.position.copy(finishPosition);
+  scene.add(gateMesh);
+
   const rig = new FlightRig(canvas);
   rig.reset([0, 0, 0]);
   camera.position.copy(rig.position);
   camera.quaternion.copy(rig.quaternion);
+  const prevShipPos = rig.position.clone();
 
   const compass = new CompassHUD(120);
   const timer = new CourseTimer({ storageKey: "course-best:asteroid-dodge" });
   const hitFlash = new HitFlash();
-  const finishPosition = new THREE.Vector3(0, 0, -COURSE_LENGTH);
 
   let invulnerable = 0;
 
   function restart(): void {
     rig.reset([0, 0, 0]);
+    prevShipPos.copy(rig.position);
     invulnerable = 0;
     timer.restart();
     asteroids.forEach((a, i) => {
@@ -142,13 +158,17 @@ function setup(ctx: SceneContext): SceneInstance {
         }
       }
 
-      if (timer.state === "racing" && rig.position.distanceTo(finishPosition) < FINISH_RADIUS) {
+      if (timer.state === "racing" && crossedPlane(prevShipPos, rig.position, finishPosition, gateNormal, GATE_PASS_RADIUS)) {
         timer.finish();
       }
+      prevShipPos.copy(rig.position);
 
       camera.position.copy(rig.position);
       camera.quaternion.copy(rig.quaternion);
       shipLight.position.copy(rig.position);
+
+      const pulse = 0.6 + Math.sin(performance.now() / 200) * 0.4;
+      gateMaterial.emissiveIntensity = 0.5 + pulse;
 
       compass.update(camera, [{ label: "Finish", color: "#8fe3a0", position: finishPosition }], delta);
     },
@@ -156,6 +176,10 @@ function setup(ctx: SceneContext): SceneInstance {
       rig.dispose();
       compass.dispose();
       hitFlash.dispose();
+
+      gateGeometry.dispose();
+      gateMaterial.dispose();
+      scene.remove(gateMesh);
 
       rockGeometry.dispose();
       rockMaterial.dispose();

@@ -14,6 +14,10 @@ const FLICK_TIME_MS = 220;
 const FLICK_DIST_PX = 38;
 const FLICK_MAX_ANGLE = THREE.MathUtils.degToRad(10);
 
+// A second finger landing in the move zone controls vertical strafe (drag up
+// to ascend, down to descend) — this px range maps to full deflection.
+const VERTICAL_RANGE_PX = 90;
+
 type Scheme = "dual-stick" | "gyro-move";
 
 /**
@@ -59,6 +63,10 @@ export class FlightRig {
   private readonly pointers = new Map<number, { x: number; y: number }>();
   private moveTouchId: number | null = null;
   private moveOrigin = { x: 0, y: 0 };
+  private moveSecondaryTouchId: number | null = null;
+  private moveSecondaryOriginY = 0;
+  private verticalInput = 0;
+  private readonly verticalIndicator: HTMLDivElement;
   private lookTouchId: number | null = null;
   private lookOrigin = { x: 0, y: 0 };
   private lastLookDx = 0;
@@ -75,6 +83,12 @@ export class FlightRig {
     this.lookStick = new VirtualJoystick(document.body, { color: "#4da3ff", audio: this.audio });
     this.moveStick.audioEnabled = this.params.audioFeedback;
     this.lookStick.audioEnabled = this.params.audioFeedback;
+
+    this.verticalIndicator = document.createElement("div");
+    this.verticalIndicator.className = "vertical-indicator";
+    this.verticalIndicator.textContent = "⇕";
+    this.verticalIndicator.hidden = true;
+    document.body.appendChild(this.verticalIndicator);
 
     canvas.addEventListener("pointerdown", this.onPointerDown, { passive: true });
     canvas.addEventListener("pointermove", this.onPointerMove, { passive: true });
@@ -137,6 +151,9 @@ export class FlightRig {
     this.lookStick.hide();
     this.pointers.clear();
     this.moveTouchId = null;
+    this.moveSecondaryTouchId = null;
+    this.verticalInput = 0;
+    this.verticalIndicator.hidden = true;
     this.lookTouchId = null;
     this.rollTouchId = null;
     this.gyroTrimPrev = null;
@@ -151,35 +168,39 @@ export class FlightRig {
     }
     this.pointers.set(e.pointerId, { x: e.clientX, y: e.clientY });
 
-    if (this.params.scheme === "gyro-move") {
+    const isRight = e.clientX >= window.innerWidth / 2;
+    const inMoveZone = this.params.scheme === "gyro-move" || !isRight;
+
+    if (inMoveZone) {
       if (this.moveTouchId === null) {
         this.moveTouchId = e.pointerId;
         this.moveOrigin = { x: e.clientX, y: e.clientY };
         this.moveStick.show(e.clientX, e.clientY);
+      } else if (this.moveSecondaryTouchId === null) {
+        // A second finger in the move zone controls vertical strafe, mirroring
+        // how a second finger on the look stick controls roll.
+        this.moveSecondaryTouchId = e.pointerId;
+        this.moveSecondaryOriginY = e.clientY;
+        this.verticalIndicator.hidden = false;
+        this.verticalIndicator.style.left = `${e.clientX}px`;
+        this.verticalIndicator.style.top = `${e.clientY}px`;
       }
       return;
     }
 
-    const isRight = e.clientX >= window.innerWidth / 2;
-    if (!isRight && this.moveTouchId === null) {
-      this.moveTouchId = e.pointerId;
-      this.moveOrigin = { x: e.clientX, y: e.clientY };
-      this.moveStick.show(e.clientX, e.clientY);
-    } else if (isRight) {
-      if (this.lookTouchId === null) {
-        this.lookTouchId = e.pointerId;
-        this.lookOrigin = { x: e.clientX, y: e.clientY };
-        this.lastLookDx = 0;
-        this.lastLookDy = 0;
-        this.lookTouchStartTime = performance.now();
-        this.lookMode = "position";
-        this.lookBaseQuaternion.copy(this.quaternion);
-        this.lookStick.show(e.clientX, e.clientY);
-      } else if (this.rollTouchId === null) {
-        this.rollTouchId = e.pointerId;
-        const a = this.pointers.get(this.lookTouchId);
-        if (a) this.rollPrevAngle = Math.atan2(e.clientY - a.y, e.clientX - a.x);
-      }
+    if (this.lookTouchId === null) {
+      this.lookTouchId = e.pointerId;
+      this.lookOrigin = { x: e.clientX, y: e.clientY };
+      this.lastLookDx = 0;
+      this.lastLookDy = 0;
+      this.lookTouchStartTime = performance.now();
+      this.lookMode = "position";
+      this.lookBaseQuaternion.copy(this.quaternion);
+      this.lookStick.show(e.clientX, e.clientY);
+    } else if (this.rollTouchId === null) {
+      this.rollTouchId = e.pointerId;
+      const a = this.pointers.get(this.lookTouchId);
+      if (a) this.rollPrevAngle = Math.atan2(e.clientY - a.y, e.clientX - a.x);
     }
   };
 
@@ -189,6 +210,9 @@ export class FlightRig {
 
     if (e.pointerId === this.moveTouchId) {
       this.moveStick.feed(e.clientX - this.moveOrigin.x, e.clientY - this.moveOrigin.y);
+    } else if (e.pointerId === this.moveSecondaryTouchId) {
+      const dy = e.clientY - this.moveSecondaryOriginY;
+      this.verticalInput = THREE.MathUtils.clamp(-dy / VERTICAL_RANGE_PX, -1, 1);
     }
 
     // A second finger landing on the look stick switches that hand to a
@@ -216,6 +240,14 @@ export class FlightRig {
     if (e.pointerId === this.moveTouchId) {
       this.moveTouchId = null;
       this.moveStick.hide();
+      this.moveSecondaryTouchId = null;
+      this.verticalInput = 0;
+      this.verticalIndicator.hidden = true;
+    }
+    if (e.pointerId === this.moveSecondaryTouchId) {
+      this.moveSecondaryTouchId = null;
+      this.verticalInput = 0;
+      this.verticalIndicator.hidden = true;
     }
     if (e.pointerId === this.lookTouchId) {
       this.lookTouchId = null;
@@ -307,7 +339,7 @@ export class FlightRig {
 
     const thrust = -this.moveStick.value.y;
     const strafe = this.moveStick.value.x;
-    const targetVelocity = new THREE.Vector3(strafe, 0, -thrust)
+    const targetVelocity = new THREE.Vector3(strafe, this.verticalInput, -thrust)
       .multiplyScalar(params.maxSpeed)
       .applyQuaternion(this.quaternion);
 
@@ -326,5 +358,6 @@ export class FlightRig {
     this.moveStick.dispose();
     this.lookStick.dispose();
     this.audio.dispose();
+    this.verticalIndicator.remove();
   }
 }

@@ -1,9 +1,10 @@
 import * as THREE from "three";
 import type { SceneContext, SceneInstance, TestScene } from "./types.ts";
-import { CompassHUD } from "../core/compass-hud.ts";
+import { ScannerHUD } from "../core/scanner-hud.ts";
 import { FlightRig } from "../core/flight-rig.ts";
 import { CourseTimer } from "../core/course-timer.ts";
 import { buildStarfield } from "../core/starfield.ts";
+import { crossedPlane } from "../core/plane-crossing.ts";
 
 const RING_RADIUS = 14;
 const SHIP_RADIUS = 3;
@@ -78,7 +79,7 @@ function setup(ctx: SceneContext): SceneInstance {
   camera.position.copy(rig.position);
   camera.quaternion.copy(rig.quaternion);
 
-  const compass = new CompassHUD(120);
+  const scanner = new ScannerHUD(150, 220);
   const timer = new CourseTimer({ storageKey: "course-best:ring-race" });
 
   let currentRing = 0;
@@ -100,14 +101,7 @@ function setup(ctx: SceneContext): SceneInstance {
   function checkRingCrossing(): void {
     if (currentRing >= ringDefs.length) return;
     const ring = ringDefs[currentRing];
-    const dPrev = prevShipPos.clone().sub(ring.position).dot(ring.normal);
-    const dCurr = rig.position.clone().sub(ring.position).dot(ring.normal);
-    if ((dPrev < 0) === (dCurr < 0)) return; // didn't cross the ring's plane this frame
-
-    const t = dPrev / (dPrev - dCurr);
-    const crossPoint = prevShipPos.clone().lerp(rig.position, t);
-    const lateral = crossPoint.sub(ring.position).length();
-    if (lateral > PASS_RADIUS) return; // crossed the plane, but outside the hoop
+    if (!crossedPlane(prevShipPos, rig.position, ring.position, ring.normal, PASS_RADIUS)) return;
 
     currentRing += 1;
     if (currentRing >= ringDefs.length) {
@@ -138,16 +132,14 @@ function setup(ctx: SceneContext): SceneInstance {
 
       if (currentRing < ringDefs.length) {
         const next = ringDefs[currentRing];
-        compass.update(
-          camera,
-          [{ label: `Ring ${currentRing + 1}/${ringDefs.length}`, color: "#ffd24d", position: next.position }],
-          delta,
-        );
+        scanner.update(rig.position, rig.quaternion, [
+          { label: `Ring ${currentRing + 1}/${ringDefs.length}`, color: "#ffd24d", position: next.position },
+        ]);
       }
     },
     dispose() {
       rig.dispose();
-      compass.dispose();
+      scanner.dispose();
 
       ringGeometry.dispose();
       ringDefs.forEach((ring) => {
