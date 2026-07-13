@@ -95,8 +95,11 @@ export class FlightRig {
     this.verticalIndicator.hidden = true;
     document.body.appendChild(this.verticalIndicator);
 
+    // Both on the left: the GUI panel is right-anchored and its max-height can
+    // reach nearly full screen height, so a right-edge slider risks sitting
+    // right under (and behind) the GUI's own interactive controls.
     this.verticalSlider = new EdgeSlider(document.body, { side: "left", color: "#8fe3a0" });
-    this.rollSlider = new EdgeSlider(document.body, { side: "right", color: "#4da3ff" });
+    this.rollSlider = new EdgeSlider(document.body, { side: "left", offsetPx: 36, color: "#4da3ff" });
     const slidersVisible = this.params.auxInput === "sliders";
     this.verticalSlider.setVisible(slidersVisible);
     this.rollSlider.setVisible(slidersVisible);

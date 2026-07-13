@@ -1,5 +1,7 @@
 export interface EdgeSliderOptions {
   side: "left" | "right";
+  /** Extra shift away from the edge, in px — lets two sliders sit side by side. */
+  offsetPx?: number;
   color?: string;
   trackHeight?: number; // px
 }
@@ -25,10 +27,16 @@ export class EdgeSlider {
 
   constructor(container: HTMLElement, opts: EdgeSliderOptions) {
     const trackHeight = opts.trackHeight ?? 160;
+    const offset = opts.offsetPx ?? 0;
     this.track = document.createElement("div");
-    this.track.className = `edge-slider edge-slider-${opts.side}`;
+    this.track.className = "edge-slider";
     this.track.style.height = `${trackHeight}px`;
     this.track.style.borderColor = opts.color ?? "#4da3ff";
+    if (opts.side === "left") {
+      this.track.style.left = `calc(var(--safe-left) + ${8 + offset}px)`;
+    } else {
+      this.track.style.right = `calc(var(--safe-right) + ${8 + offset}px)`;
+    }
 
     this.handle = document.createElement("div");
     this.handle.className = "edge-slider-handle";
@@ -52,7 +60,7 @@ export class EdgeSlider {
   tryClaim(pointerId: number, clientX: number, clientY: number): boolean {
     if (this.track.hidden || this.activePointerId !== null) return false;
     const rect = this.track.getBoundingClientRect();
-    const margin = 16;
+    const margin = 8; // small — two sliders now sit close together on the same edge
     if (clientX < rect.left - margin || clientX > rect.right + margin || clientY < rect.top || clientY > rect.bottom) {
       return false;
     }

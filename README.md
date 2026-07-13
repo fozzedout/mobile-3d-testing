@@ -18,8 +18,10 @@ GPU limits, and battery-friendly rendering.
 The three courses share a `FlightRig` (the exact touch-nav controls tuned in Space Sim — same GUI, same toggles) and a `CourseTimer` (countdown → racing → finished, hit penalties, localStorage best time).
 
 FlightRig's vertical strafe and roll (the 4th/5th DOF beyond translate+look) have two switchable input modes ("Vertical/roll input" in the GUI):
-- **Sliders** (default) — two persistent, always-visible edge sliders (left = vertical, right = roll). Touch anywhere on one to jump the handle there and hold it deflected to sustain a rate — roll is rate control here, not position control, so holding a pose is enough; no continued motion needed.
+- **Sliders** (default) — two persistent, always-visible edge sliders, both on the left (the GUI panel is right-anchored and can grow almost full-height, so a right-edge slider would end up fighting it for touches). Touch anywhere on one to jump the handle there and hold it deflected to sustain a rate — roll is rate control here, not position control, so holding a pose is enough; no continued motion needed.
 - **Fingers** — the original multi-touch gestures: a second finger in the move-stick zone strafes up/down, a second finger on the look stick twists to roll (this one maps the twist angle directly to roll angle — precise, but physically hard to sustain past a partial turn since twisting fingers around each other runs out of comfortable range fast).
+
+The whole app also blocks double-tap and pinch zoom at the event level (`core/prevent-zoom.ts`) — iOS Safari ignores the viewport meta's `user-scalable=no` since iOS 10, so `touch-action`/viewport settings alone can't be trusted to stop an accidental zoom from derailing the touch controls.
 
 Each scene is a self-contained module in `src/scenes/`; add a new one by
 creating a file that exports a `TestScene` (see `src/scenes/types.ts`) and

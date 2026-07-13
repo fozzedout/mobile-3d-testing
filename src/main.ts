@@ -4,9 +4,12 @@ import { RendererContext } from "./core/renderer-context.ts";
 import { Ticker } from "./core/ticker.ts";
 import { FpsMeter } from "./core/fps-meter.ts";
 import { renderDeviceInfo } from "./core/device-info.ts";
+import { preventZoomGestures } from "./core/prevent-zoom.ts";
 import { sceneRegistry } from "./scenes/index.ts";
 import type { SceneInstance } from "./scenes/types.ts";
 import "./style.css";
+
+preventZoomGestures();
 
 const canvas = document.querySelector<HTMLCanvasElement>("#scene")!;
 const select = document.querySelector<HTMLSelectElement>("#scene-select")!;

@@ -207,14 +207,8 @@ body {
   border: 2px solid #4da3ff;
   border-radius: 14px;
   background: rgba(20, 22, 28, 0.35);
-}
-
-.edge-slider-left {
-  left: calc(var(--safe-left) + 8px);
-}
-
-.edge-slider-right {
-  right: calc(var(--safe-right) + 8px);
+  pointer-events: none;
+  touch-action: none;
 }
 
 .edge-slider-handle {
