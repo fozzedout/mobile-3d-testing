@@ -72,6 +72,8 @@ export class FlightRig {
   private readonly verticalIndicator: HTMLDivElement;
   private readonly verticalSlider: EdgeSlider;
   private readonly rollSlider: EdgeSlider;
+  private readonly guiResizeObserver: ResizeObserver;
+  private guiEl: HTMLElement | null = null;
   private lookTouchId: number | null = null;
   private lookOrigin = { x: 0, y: 0 };
   private lastLookDx = 0;
@@ -95,14 +97,19 @@ export class FlightRig {
     this.verticalIndicator.hidden = true;
     document.body.appendChild(this.verticalIndicator);
 
-    // Both on the left: the GUI panel is right-anchored and its max-height can
-    // reach nearly full screen height, so a right-edge slider risks sitting
-    // right under (and behind) the GUI's own interactive controls.
+    // Paired with the same hand as their "primary" stick, so both can be held
+    // at once: vertical strafe sits with the move stick (left), roll sits
+    // with the look stick (right) — thrust + roll is exactly what Rotor
+    // Gates asks you to hold simultaneously. The roll slider's right-edge
+    // position is adjusted at runtime to clear the GUI panel (see
+    // repositionRollSlider), since the GUI can grow to nearly full height.
     this.verticalSlider = new EdgeSlider(document.body, { side: "left", color: "#8fe3a0" });
-    this.rollSlider = new EdgeSlider(document.body, { side: "left", offsetPx: 36, color: "#4da3ff" });
+    this.rollSlider = new EdgeSlider(document.body, { side: "right", color: "#4da3ff" });
     const slidersVisible = this.params.auxInput === "sliders";
     this.verticalSlider.setVisible(slidersVisible);
     this.rollSlider.setVisible(slidersVisible);
+
+    this.guiResizeObserver = new ResizeObserver(() => this.repositionRollSlider());
 
     canvas.addEventListener("pointerdown", this.onPointerDown, { passive: true });
     canvas.addEventListener("pointermove", this.onPointerMove, { passive: true });
@@ -133,6 +140,33 @@ export class FlightRig {
       this.lookStick.audioEnabled = v;
     });
     gui.add(params, "speed").name("Speed (u/s)").listen().disable();
+
+    this.guiEl = gui.domElement;
+    this.guiResizeObserver.observe(this.guiEl);
+    this.repositionRollSlider();
+  }
+
+  /**
+   * Keeps the roll slider clear of the GUI panel by measuring its actual
+   * rendered bounds rather than assuming a fixed height — the panel's
+   * content (and therefore height) varies a lot between scenes, and can
+   * grow to nearly the full screen on the courses with the most controls.
+   */
+  private repositionRollSlider(): void {
+    if (!this.guiEl) return;
+    const rect = this.guiEl.getBoundingClientRect();
+    const guiVisible = rect.height > 0 && getComputedStyle(this.guiEl).display !== "none";
+    if (!guiVisible) {
+      this.rollSlider.setBounds(null, 160); // GUI hidden — back to the default centered position
+      return;
+    }
+    // Always anchored strictly below the GUI's real bottom edge, however far
+    // down that is — shrinking the slider is fine, overlapping the GUI isn't.
+    const margin = 12;
+    const top = rect.bottom + margin;
+    const available = window.innerHeight - top - 16;
+    const height = Math.max(40, Math.min(180, available));
+    this.rollSlider.setBounds(top, height);
   }
 
   reset(position: THREE.Vector3Tuple = [0, 0, 0], quaternion?: THREE.Quaternion): void {
@@ -410,6 +444,7 @@ export class FlightRig {
     this.lookStick.dispose();
     this.audio.dispose();
     this.verticalIndicator.remove();
+    this.guiResizeObserver.disconnect();
     this.verticalSlider.dispose();
     this.rollSlider.dispose();
   }

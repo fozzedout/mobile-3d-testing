@@ -52,6 +52,18 @@ export class EdgeSlider {
     if (!visible) this.forceRelease();
   }
 
+  /** Overrides the default vertically-centered position — pass topPx=null to restore it. */
+  setBounds(topPx: number | null, heightPx: number): void {
+    this.track.style.height = `${heightPx}px`;
+    if (topPx === null) {
+      this.track.style.top = "50%";
+      this.track.style.transform = "translateY(-50%)";
+    } else {
+      this.track.style.top = `${topPx}px`;
+      this.track.style.transform = "none";
+    }
+  }
+
   get isActive(): boolean {
     return this.activePointerId !== null;
   }
@@ -60,7 +72,7 @@ export class EdgeSlider {
   tryClaim(pointerId: number, clientX: number, clientY: number): boolean {
     if (this.track.hidden || this.activePointerId !== null) return false;
     const rect = this.track.getBoundingClientRect();
-    const margin = 8; // small — two sliders now sit close together on the same edge
+    const margin = 16; // each slider has its own edge again, so a generous margin is fine
     if (clientX < rect.left - margin || clientX > rect.right + margin || clientY < rect.top || clientY > rect.bottom) {
       return false;
     }
