@@ -100,12 +100,12 @@ function setup(ctx: SceneContext): SceneInstance {
     scheme: "dual-stick" as Scheme,
     maxSpeed: DEFAULT_MAX_SPEED,
     lookRate: DEFAULT_LOOK_RATE,
-    audioFeedback: true,
+    audioFeedback: false,
     motionStatus: "tap Enable motion",
     speed: 0,
     gyroTrim: false,
     gyroTrimStrength: 0.25,
-    precisionFlick: true,
+    precisionFlick: false,
     rotationalInertia: false,
     inertiaRampMs: 120,
     inertiaBrakeMs: 90,
@@ -113,6 +113,8 @@ function setup(ctx: SceneContext): SceneInstance {
 
   const moveStick = new VirtualJoystick(document.body, { color: "#8fe3a0", audio });
   const lookStick = new VirtualJoystick(document.body, { color: "#4da3ff", audio });
+  moveStick.audioEnabled = params.audioFeedback;
+  lookStick.audioEnabled = params.audioFeedback;
 
   function resetShip(): void {
     shipPosition.set(0, 0, 0);
