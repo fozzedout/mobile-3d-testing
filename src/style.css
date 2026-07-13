@@ -198,6 +198,15 @@ body {
   pointer-events: none;
 }
 
+.hit-flash {
+  position: fixed;
+  inset: 0;
+  z-index: 40;
+  pointer-events: none;
+  background: radial-gradient(ellipse at center, rgba(255, 60, 60, 0) 40%, rgba(255, 40, 40, 0.9) 100%);
+  opacity: 0;
+}
+
 .lil-gui.root {
   top: calc(var(--safe-top) + 56px) !important;
   right: calc(var(--safe-right) + 8px) !important;

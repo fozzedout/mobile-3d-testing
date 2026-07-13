@@ -40,4 +40,22 @@ export const sceneRegistry: SceneMeta[] = [
     description: "6DOF flight lab with a compass HUD — a testbed for touch navigation schemes.",
     load: () => import("./space-sim.ts").then((m) => m.spaceSimScene),
   },
+  {
+    id: "ring-race",
+    name: "Course: Ring Race",
+    description: "Timed run: fly through every ring in order, start to finish.",
+    load: () => import("./ring-race.ts").then((m) => m.ringRaceScene),
+  },
+  {
+    id: "structure-run",
+    name: "Course: Structure Run",
+    description: "Timed run through a winding tunnel — avoid the walls and jutting obstacles.",
+    load: () => import("./structure-run.ts").then((m) => m.structureRunScene),
+  },
+  {
+    id: "asteroid-dodge",
+    name: "Course: Asteroid Shower",
+    description: "Timed run to the finish marker, dodging a continuous field of drifting rocks.",
+    load: () => import("./asteroid-dodge.ts").then((m) => m.asteroidDodgeScene),
+  },
 ];

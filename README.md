@@ -11,6 +11,11 @@ GPU limits, and battery-friendly rendering.
 - **Touch & Gyro** — visualizes raw multi-touch points and `deviceorientation` sensor data (with the iOS motion-permission prompt wired up).
 - **Load Model (GLTF)** — drag & drop a `.glb`/`.gltf` file to inspect it on-device (triangle/node counts, wireframe toggle).
 - **Space Sim (Touch Nav)** — a free-flight 6DOF lab: a cube and sphere placed far apart, found via an on-screen bearing compass. Built to A/B touch-navigation schemes: dual floating joysticks (rate-control translate + look, with a second finger on the look stick switching to a twist-to-roll gesture) vs. gyro-look + touch-thrust (device orientation for looking, one thumb for movement). Joysticks apply a logarithmic pseudo-haptic "wall" past their soft limit and synthesize click/thud audio as a Taptic Engine stand-in. Also has four independently toggleable fixes for rate-control overshoot: a gyro fine-trim layer (relative tilt nudges look on top of the stick, instead of replacing it), a time-based rate/position hybrid on the look stick (quick flicks are precise no-momentum nudges; holding promotes to continuous turning), a rotational-inertia mode (momentum while held, fast brake on release) to compare against the default instant-stop response, and a closing-rate readout on the compass so you can see you're approaching a target too fast before you sail past it.
+- **Course: Ring Race** — timed run through a fixed slalom of rings; the compass points at the next ring, and best time persists locally.
+- **Course: Structure Run** — timed flight down a winding tunnel (ribbed walls + a few jutting obstacles to dodge); hitting a wall/obstacle adds a time penalty with a brief invulnerability window and a screen flash, rather than resetting your run.
+- **Course: Asteroid Shower** — timed run to a finish marker through a continuously-respawning field of drifting rocks; same hit-penalty-and-flash feedback as Structure Run.
+
+The three courses share a `FlightRig` (the exact touch-nav controls tuned in Space Sim — same GUI, same toggles) and a `CourseTimer` (countdown → racing → finished, hit penalties, localStorage best time).
 
 Each scene is a self-contained module in `src/scenes/`; add a new one by
 creating a file that exports a `TestScene` (see `src/scenes/types.ts`) and
