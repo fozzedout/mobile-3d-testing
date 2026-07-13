@@ -231,6 +231,14 @@ body {
   pointer-events: none;
 }
 
+.alignment-hud {
+  position: fixed;
+  bottom: calc(var(--safe-bottom) + 16px);
+  left: calc(var(--safe-left) + 8px);
+  z-index: 20;
+  pointer-events: none;
+}
+
 .hit-flash {
   position: fixed;
   inset: 0;

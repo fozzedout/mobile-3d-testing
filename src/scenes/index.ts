@@ -58,4 +58,10 @@ export const sceneRegistry: SceneMeta[] = [
     description: "Timed run to the finish marker, dodging a continuous field of drifting rocks.",
     load: () => import("./asteroid-dodge.ts").then((m) => m.asteroidDodgeScene),
   },
+  {
+    id: "rotor-gates",
+    name: "Course: Rotor Gates",
+    description: "Match roll to a spinning slot before flying through — rated on alignment.",
+    load: () => import("./rotor-gates.ts").then((m) => m.rotorGatesScene),
+  },
 ];
