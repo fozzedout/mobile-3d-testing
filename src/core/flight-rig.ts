@@ -2,6 +2,7 @@ import * as THREE from "three";
 import type GUI from "lil-gui";
 import { AudioClicker } from "./audio-ticks.ts";
 import { VirtualJoystick } from "./virtual-joystick.ts";
+import { EdgeSlider } from "./edge-slider.ts";
 import { orientationToQuaternion, requestMotionPermission } from "./device-orientation.ts";
 
 const DEFAULT_MAX_SPEED = 60;
@@ -19,6 +20,7 @@ const FLICK_MAX_ANGLE = THREE.MathUtils.degToRad(10);
 const VERTICAL_RANGE_PX = 90;
 
 type Scheme = "dual-stick" | "gyro-move";
+type AuxInput = "sliders" | "fingers";
 
 /**
  * The shared 6DOF touch-navigation rig originally built for the Space Sim
@@ -47,6 +49,7 @@ export class FlightRig {
     rotationalInertia: false,
     inertiaRampMs: 120,
     inertiaBrakeMs: 90,
+    auxInput: "sliders" as AuxInput,
   };
 
   private readonly canvas: HTMLCanvasElement;
@@ -65,8 +68,10 @@ export class FlightRig {
   private moveOrigin = { x: 0, y: 0 };
   private moveSecondaryTouchId: number | null = null;
   private moveSecondaryOriginY = 0;
-  private verticalInput = 0;
+  private fingerVerticalInput = 0;
   private readonly verticalIndicator: HTMLDivElement;
+  private readonly verticalSlider: EdgeSlider;
+  private readonly rollSlider: EdgeSlider;
   private lookTouchId: number | null = null;
   private lookOrigin = { x: 0, y: 0 };
   private lastLookDx = 0;
@@ -90,6 +95,12 @@ export class FlightRig {
     this.verticalIndicator.hidden = true;
     document.body.appendChild(this.verticalIndicator);
 
+    this.verticalSlider = new EdgeSlider(document.body, { side: "left", color: "#8fe3a0" });
+    this.rollSlider = new EdgeSlider(document.body, { side: "right", color: "#4da3ff" });
+    const slidersVisible = this.params.auxInput === "sliders";
+    this.verticalSlider.setVisible(slidersVisible);
+    this.rollSlider.setVisible(slidersVisible);
+
     canvas.addEventListener("pointerdown", this.onPointerDown, { passive: true });
     canvas.addEventListener("pointermove", this.onPointerMove, { passive: true });
     canvas.addEventListener("pointerup", this.releasePointer, { passive: true });
@@ -108,6 +119,10 @@ export class FlightRig {
     gui.add(params, "rotationalInertia").name("Rotational inertia");
     gui.add(params, "inertiaRampMs", 30, 400, 10).name("Inertia ramp-in (ms)");
     gui.add(params, "inertiaBrakeMs", 30, 400, 10).name("Inertia brake (ms)");
+    gui
+      .add(params, "auxInput", ["sliders", "fingers"])
+      .name("Vertical/roll input")
+      .onChange(this.onAuxInputChange);
     gui.add(params, "maxSpeed", 10, 150, 5).name("Max speed");
     gui.add(params, "lookRate", 30, 180, 5).name("Look sensitivity");
     gui.add(params, "audioFeedback").name("Audio feedback").onChange((v: boolean) => {
@@ -152,11 +167,20 @@ export class FlightRig {
     this.pointers.clear();
     this.moveTouchId = null;
     this.moveSecondaryTouchId = null;
-    this.verticalInput = 0;
+    this.fingerVerticalInput = 0;
     this.verticalIndicator.hidden = true;
+    this.verticalSlider.forceReset();
+    this.rollSlider.forceReset();
     this.lookTouchId = null;
     this.rollTouchId = null;
     this.gyroTrimPrev = null;
+  };
+
+  private readonly onAuxInputChange = (): void => {
+    const slidersVisible = this.params.auxInput === "sliders";
+    this.verticalSlider.setVisible(slidersVisible);
+    this.rollSlider.setVisible(slidersVisible);
+    this.resetTouchState();
   };
 
   private readonly onPointerDown = (e: PointerEvent): void => {
@@ -168,6 +192,11 @@ export class FlightRig {
     }
     this.pointers.set(e.pointerId, { x: e.clientX, y: e.clientY });
 
+    if (this.params.auxInput === "sliders") {
+      if (this.verticalSlider.tryClaim(e.pointerId, e.clientX, e.clientY)) return;
+      if (this.rollSlider.tryClaim(e.pointerId, e.clientX, e.clientY)) return;
+    }
+
     const isRight = e.clientX >= window.innerWidth / 2;
     const inMoveZone = this.params.scheme === "gyro-move" || !isRight;
 
@@ -176,7 +205,7 @@ export class FlightRig {
         this.moveTouchId = e.pointerId;
         this.moveOrigin = { x: e.clientX, y: e.clientY };
         this.moveStick.show(e.clientX, e.clientY);
-      } else if (this.moveSecondaryTouchId === null) {
+      } else if (this.params.auxInput === "fingers" && this.moveSecondaryTouchId === null) {
         // A second finger in the move zone controls vertical strafe, mirroring
         // how a second finger on the look stick controls roll.
         this.moveSecondaryTouchId = e.pointerId;
@@ -197,7 +226,7 @@ export class FlightRig {
       this.lookMode = "position";
       this.lookBaseQuaternion.copy(this.quaternion);
       this.lookStick.show(e.clientX, e.clientY);
-    } else if (this.rollTouchId === null) {
+    } else if (this.params.auxInput === "fingers" && this.rollTouchId === null) {
       this.rollTouchId = e.pointerId;
       const a = this.pointers.get(this.lookTouchId);
       if (a) this.rollPrevAngle = Math.atan2(e.clientY - a.y, e.clientX - a.x);
@@ -208,11 +237,16 @@ export class FlightRig {
     if (!this.pointers.has(e.pointerId)) return;
     this.pointers.set(e.pointerId, { x: e.clientX, y: e.clientY });
 
+    if (this.params.auxInput === "sliders") {
+      if (this.verticalSlider.feed(e.pointerId, e.clientY)) return;
+      if (this.rollSlider.feed(e.pointerId, e.clientY)) return;
+    }
+
     if (e.pointerId === this.moveTouchId) {
       this.moveStick.feed(e.clientX - this.moveOrigin.x, e.clientY - this.moveOrigin.y);
     } else if (e.pointerId === this.moveSecondaryTouchId) {
       const dy = e.clientY - this.moveSecondaryOriginY;
-      this.verticalInput = THREE.MathUtils.clamp(-dy / VERTICAL_RANGE_PX, -1, 1);
+      this.fingerVerticalInput = THREE.MathUtils.clamp(-dy / VERTICAL_RANGE_PX, -1, 1);
     }
 
     // A second finger landing on the look stick switches that hand to a
@@ -237,16 +271,19 @@ export class FlightRig {
 
   private readonly releasePointer = (e: PointerEvent): void => {
     this.pointers.delete(e.pointerId);
+    this.verticalSlider.release(e.pointerId);
+    this.rollSlider.release(e.pointerId);
+
     if (e.pointerId === this.moveTouchId) {
       this.moveTouchId = null;
       this.moveStick.hide();
       this.moveSecondaryTouchId = null;
-      this.verticalInput = 0;
+      this.fingerVerticalInput = 0;
       this.verticalIndicator.hidden = true;
     }
     if (e.pointerId === this.moveSecondaryTouchId) {
       this.moveSecondaryTouchId = null;
-      this.verticalInput = 0;
+      this.fingerVerticalInput = 0;
       this.verticalIndicator.hidden = true;
     }
     if (e.pointerId === this.lookTouchId) {
@@ -331,15 +368,26 @@ export class FlightRig {
       }
     }
 
-    if (this.pendingRoll !== 0) {
+    if (params.auxInput === "sliders") {
+      // Rate control (hold the slider deflected to keep rolling) rather than
+      // the finger gesture's position control (twist angle maps directly to
+      // roll angle) — a held pose is far easier to sustain than a continuous
+      // twisting motion, which runs out of comfortable wrist range fast.
+      const rollRate = -this.rollSlider.value * lookRateRad;
+      if (rollRate !== 0) {
+        const rollQuat = new THREE.Quaternion().setFromAxisAngle(new THREE.Vector3(0, 0, 1), rollRate * delta);
+        this.quaternion.multiply(rollQuat);
+      }
+    } else if (this.pendingRoll !== 0) {
       const rollQuat = new THREE.Quaternion().setFromAxisAngle(new THREE.Vector3(0, 0, 1), -this.pendingRoll);
       this.quaternion.multiply(rollQuat);
       this.pendingRoll = 0;
     }
 
+    const verticalInput = params.auxInput === "sliders" ? this.verticalSlider.value : this.fingerVerticalInput;
     const thrust = -this.moveStick.value.y;
     const strafe = this.moveStick.value.x;
-    const targetVelocity = new THREE.Vector3(strafe, this.verticalInput, -thrust)
+    const targetVelocity = new THREE.Vector3(strafe, verticalInput, -thrust)
       .multiplyScalar(params.maxSpeed)
       .applyQuaternion(this.quaternion);
 
@@ -359,5 +407,7 @@ export class FlightRig {
     this.lookStick.dispose();
     this.audio.dispose();
     this.verticalIndicator.remove();
+    this.verticalSlider.dispose();
+    this.rollSlider.dispose();
   }
 }

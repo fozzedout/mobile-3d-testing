@@ -15,7 +15,11 @@ GPU limits, and battery-friendly rendering.
 - **Course: Structure Run** — timed flight down a winding tunnel (ribbed walls + a few jutting obstacles to dodge); hitting a wall/obstacle adds a time penalty with a brief invulnerability window and a screen flash, rather than resetting your run.
 - **Course: Asteroid Shower** — timed run through a continuously-respawning field of drifting rocks to a large glowing finish gate (fly through it, same crossing check as the rings); same hit-penalty-and-flash feedback as Structure Run.
 
-The three courses share a `FlightRig` (the exact touch-nav controls tuned in Space Sim — same GUI, same toggles, now with a true 6th degree of freedom: a second finger held in the move-stick zone controls vertical strafe, dragging up to ascend/down to descend, mirroring how a second finger on the look stick controls roll) and a `CourseTimer` (countdown → racing → finished, hit penalties, localStorage best time).
+The three courses share a `FlightRig` (the exact touch-nav controls tuned in Space Sim — same GUI, same toggles) and a `CourseTimer` (countdown → racing → finished, hit penalties, localStorage best time).
+
+FlightRig's vertical strafe and roll (the 4th/5th DOF beyond translate+look) have two switchable input modes ("Vertical/roll input" in the GUI):
+- **Sliders** (default) — two persistent, always-visible edge sliders (left = vertical, right = roll). Touch anywhere on one to jump the handle there and hold it deflected to sustain a rate — roll is rate control here, not position control, so holding a pose is enough; no continued motion needed.
+- **Fingers** — the original multi-touch gestures: a second finger in the move-stick zone strafes up/down, a second finger on the look stick twists to roll (this one maps the twist angle directly to roll angle — precise, but physically hard to sustain past a partial turn since twisting fingers around each other runs out of comfortable range fast).
 
 Each scene is a self-contained module in `src/scenes/`; add a new one by
 creating a file that exports a `TestScene` (see `src/scenes/types.ts`) and
