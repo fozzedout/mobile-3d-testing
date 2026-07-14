@@ -64,4 +64,10 @@ export const sceneRegistry: SceneMeta[] = [
     description: "Match roll to a spinning slot before flying through — rated on alignment.",
     load: () => import("./rotor-gates.ts").then((m) => m.rotorGatesScene),
   },
+  {
+    id: "asteroids-arena",
+    name: "Course: Asteroids Arena",
+    description: "Fly, fire, and split rocks large to medium to small — nearest rocks shown on the Elite scanner.",
+    load: () => import("./asteroids-arena.ts").then((m) => m.asteroidsArenaScene),
+  },
 ];

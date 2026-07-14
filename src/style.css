@@ -304,6 +304,27 @@ body {
   pointer-events: none;
 }
 
+.fire-button {
+  position: fixed;
+  left: calc(var(--safe-left) + 16px);
+  bottom: calc(var(--safe-bottom) + 16px);
+  z-index: 25;
+  width: 68px;
+  height: 68px;
+  border-radius: 50%;
+  border: 2px solid #ff6b6b;
+  background: rgba(255, 60, 60, 0.25);
+  color: #ffecec;
+  font-weight: 600;
+  font-size: 13px;
+  letter-spacing: 0.04em;
+  touch-action: none;
+}
+
+.fire-button:active {
+  background: rgba(255, 60, 60, 0.55);
+}
+
 .hit-flash {
   position: fixed;
   inset: 0;
