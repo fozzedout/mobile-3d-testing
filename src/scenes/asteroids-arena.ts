@@ -111,7 +111,11 @@ function setup(ctx: SceneContext): SceneInstance {
     mesh.scale.setScalar(def.radius / BASE_ROCK_RADIUS);
     mesh.position.copy(position);
     scene.add(mesh);
-    const velocity = inheritedVelocity ? inheritedVelocity.clone().add(randomVelocity(10, 22)) : randomVelocity(6, 16);
+    // Split fragments dampen the parent's velocity rather than fully carrying
+    // it forward, so speed doesn't compound across generations (large ->
+    // medium -> small would otherwise stack a fresh random impulse on top of
+    // an already-boosted velocity and send small rocks rocketing away).
+    const velocity = inheritedVelocity ? inheritedVelocity.clone().multiplyScalar(0.5).add(randomVelocity(3, 7)) : randomVelocity(3, 8);
     const spin = new THREE.Vector3(Math.random() - 0.5, Math.random() - 0.5, Math.random() - 0.5).multiplyScalar(1.4);
     asteroids.push({ mesh, velocity, spin, size, radius: def.radius });
   }
