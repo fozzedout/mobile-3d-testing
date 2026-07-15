@@ -76,4 +76,10 @@ export const sceneRegistry: SceneMeta[] = [
     description: "One-on-one dogfight against a flying saucer that dodges your fire and shoots back.",
     load: () => import("./saucer-duel.ts").then((m) => m.saucerDuelScene),
   },
+  {
+    id: "wedge-duel",
+    name: "Course: Wedge Duel",
+    description: "One-on-one dogfight against a conventional fighter — orientation-locked, banks into turns, nose-mounted guns.",
+    load: () => import("./wedge-duel.ts").then((m) => m.wedgeDuelScene),
+  },
 ];
