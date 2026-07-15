@@ -22,6 +22,62 @@ const VERTICAL_RANGE_PX = 90;
 type Scheme = "dual-stick" | "gyro-move";
 type AuxInput = "sliders" | "fingers";
 
+// Persisted so tuning the controls once (which scheme, sensitivity, which of
+// the tunable extras) carries over between scenes and courses instead of
+// resetting to defaults every time a new FlightRig is constructed. Only the
+// user-facing tuning knobs are saved — not runtime readouts like `speed` or
+// `motionStatus`, which are meaningless outside the session that produced them.
+const SETTINGS_STORAGE_KEY = "flight-rig-settings";
+
+interface PersistedParams {
+  scheme: Scheme;
+  maxSpeed: number;
+  lookRate: number;
+  audioFeedback: boolean;
+  gyroTrim: boolean;
+  gyroTrimStrength: number;
+  precisionFlick: boolean;
+  rotationalInertia: boolean;
+  inertiaRampMs: number;
+  inertiaBrakeMs: number;
+  auxInput: AuxInput;
+}
+
+function loadPersistedParams(target: PersistedParams): void {
+  try {
+    const raw = localStorage.getItem(SETTINGS_STORAGE_KEY);
+    if (!raw) return;
+    const parsed = JSON.parse(raw) as Record<string, unknown>;
+    if (typeof parsed !== "object" || parsed === null) return;
+    if (parsed.scheme === "dual-stick" || parsed.scheme === "gyro-move") target.scheme = parsed.scheme;
+    if (typeof parsed.maxSpeed === "number") target.maxSpeed = parsed.maxSpeed;
+    if (typeof parsed.lookRate === "number") target.lookRate = parsed.lookRate;
+    if (typeof parsed.audioFeedback === "boolean") target.audioFeedback = parsed.audioFeedback;
+    if (typeof parsed.gyroTrim === "boolean") target.gyroTrim = parsed.gyroTrim;
+    if (typeof parsed.gyroTrimStrength === "number") target.gyroTrimStrength = parsed.gyroTrimStrength;
+    if (typeof parsed.precisionFlick === "boolean") target.precisionFlick = parsed.precisionFlick;
+    if (typeof parsed.rotationalInertia === "boolean") target.rotationalInertia = parsed.rotationalInertia;
+    if (typeof parsed.inertiaRampMs === "number") target.inertiaRampMs = parsed.inertiaRampMs;
+    if (typeof parsed.inertiaBrakeMs === "number") target.inertiaBrakeMs = parsed.inertiaBrakeMs;
+    if (parsed.auxInput === "sliders" || parsed.auxInput === "fingers") target.auxInput = parsed.auxInput;
+  } catch {
+    // Corrupt or unavailable storage (private browsing, quota) — just keep defaults.
+  }
+}
+
+function savePersistedParams(params: PersistedParams): void {
+  try {
+    const { scheme, maxSpeed, lookRate, audioFeedback, gyroTrim, gyroTrimStrength, precisionFlick, rotationalInertia, inertiaRampMs, inertiaBrakeMs, auxInput } =
+      params;
+    localStorage.setItem(
+      SETTINGS_STORAGE_KEY,
+      JSON.stringify({ scheme, maxSpeed, lookRate, audioFeedback, gyroTrim, gyroTrimStrength, precisionFlick, rotationalInertia, inertiaRampMs, inertiaBrakeMs, auxInput }),
+    );
+  } catch {
+    // Storage might be unavailable — the setting just won't persist this time.
+  }
+}
+
 /**
  * The shared 6DOF touch-navigation rig originally built for the Space Sim
  * scene: dual floating joysticks (rate-control translate + look, with a
@@ -87,6 +143,7 @@ export class FlightRig {
 
   constructor(canvas: HTMLCanvasElement) {
     this.canvas = canvas;
+    loadPersistedParams(this.params);
     this.moveStick = new VirtualJoystick(document.body, { color: "#8fe3a0", audio: this.audio });
     this.lookStick = new VirtualJoystick(document.body, { color: "#4da3ff", audio: this.audio });
     this.moveStick.audioEnabled = this.params.audioFeedback;
@@ -153,6 +210,11 @@ export class FlightRig {
       this.lookStick.audioEnabled = v;
     });
     gui.add(params, "speed").name("Speed (u/s)").listen().disable();
+
+    // Persists on ANY control change in this panel — safe because .listen()
+    // (used above for motionStatus/speed) only re-renders the display and
+    // never fires onChange, confirmed against lil-gui's source.
+    gui.onChange(() => savePersistedParams(this.params));
 
     this.guiEl = gui.domElement;
     this.guiResizeObserver.observe(this.guiEl);
