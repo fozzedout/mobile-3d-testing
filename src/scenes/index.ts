@@ -70,4 +70,10 @@ export const sceneRegistry: SceneMeta[] = [
     description: "Fly, fire, and split rocks large to medium to small — nearest rocks shown on the Elite scanner.",
     load: () => import("./asteroids-arena.ts").then((m) => m.asteroidsArenaScene),
   },
+  {
+    id: "saucer-duel",
+    name: "Course: Saucer Duel",
+    description: "One-on-one dogfight against a flying saucer that dodges your fire and shoots back.",
+    load: () => import("./saucer-duel.ts").then((m) => m.saucerDuelScene),
+  },
 ];
