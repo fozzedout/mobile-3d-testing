@@ -13,6 +13,7 @@ const FIRE_COOLDOWN = 0.22;
 const INVULN_SECONDS = 1.2;
 const START_LIVES = 3;
 const SCANNER_MAX_TARGETS = 8;
+const SWIPE_THRESHOLD_PX = 28;
 const BEST_SCORE_KEY = "course-best:asteroids-arena-score";
 
 type AsteroidSize = "large" | "medium" | "small";
@@ -196,16 +197,50 @@ function setup(ctx: SceneContext): SceneInstance {
     countdownRemaining = 3;
   }
 
-  const fireButton = document.createElement("button");
-  fireButton.className = "fire-button";
-  fireButton.textContent = "FIRE";
-  fireButton.setAttribute("aria-label", "Fire laser");
-  document.body.appendChild(fireButton);
-  const onFirePointerDown = (e: PointerEvent): void => {
+  // A big bottom-left corner zone rather than a small precise button — easy
+  // to hit without looking away from aiming. A quick tap fires once; a swipe
+  // (up to arm, down to disarm) toggles auto-fire, so the thumb can leave the
+  // zone entirely and keep steering while the ship fires on its own cooldown.
+  const fireZone = document.createElement("div");
+  fireZone.className = "fire-zone";
+  fireZone.innerHTML = '<span class="fire-zone-label">FIRE</span>';
+  document.body.appendChild(fireZone);
+  const fireZoneLabel = fireZone.querySelector(".fire-zone-label") as HTMLSpanElement;
+
+  let autoFire = false;
+  let fireGestureId: number | null = null;
+  let fireGestureStart = { x: 0, y: 0 };
+
+  function setAutoFire(on: boolean): void {
+    autoFire = on;
+    fireZone.classList.toggle("autofire", on);
+    fireZoneLabel.textContent = on ? "AUTO ON\n(swipe down to stop)" : "FIRE\n(swipe up to lock)";
+  }
+  setAutoFire(false);
+
+  const onFireZonePointerDown = (e: PointerEvent): void => {
     e.preventDefault();
-    fireLaser();
+    if (fireGestureId !== null) return;
+    fireGestureId = e.pointerId;
+    fireGestureStart = { x: e.clientX, y: e.clientY };
   };
-  fireButton.addEventListener("pointerdown", onFirePointerDown);
+  const onFireZonePointerUp = (e: PointerEvent): void => {
+    if (e.pointerId !== fireGestureId) return;
+    fireGestureId = null;
+    const dx = e.clientX - fireGestureStart.x;
+    const dy = e.clientY - fireGestureStart.y;
+    if (Math.abs(dy) > SWIPE_THRESHOLD_PX && Math.abs(dy) > Math.abs(dx)) {
+      setAutoFire(dy < 0); // swipe up arms it, swipe down disarms it
+    } else {
+      fireLaser();
+    }
+  };
+  const onFireZonePointerCancel = (e: PointerEvent): void => {
+    if (e.pointerId === fireGestureId) fireGestureId = null;
+  };
+  fireZone.addEventListener("pointerdown", onFireZonePointerDown);
+  fireZone.addEventListener("pointerup", onFireZonePointerUp);
+  fireZone.addEventListener("pointercancel", onFireZonePointerCancel);
 
   rig.registerControls(gui);
   gui.add(readout, "status").name("Status").listen().disable();
@@ -221,6 +256,7 @@ function setup(ctx: SceneContext): SceneInstance {
       if (state !== "countdown") rig.update(delta);
       if (fireCooldown > 0) fireCooldown -= delta;
       if (invulnerable > 0) invulnerable -= delta;
+      if (autoFire) fireLaser();
 
       if (state === "countdown") {
         countdownRemaining -= delta;
@@ -285,8 +321,10 @@ function setup(ctx: SceneContext): SceneInstance {
       rig.dispose();
       scanner.dispose();
       hitFlash.dispose();
-      fireButton.removeEventListener("pointerdown", onFirePointerDown);
-      fireButton.remove();
+      fireZone.removeEventListener("pointerdown", onFireZonePointerDown);
+      fireZone.removeEventListener("pointerup", onFireZonePointerUp);
+      fireZone.removeEventListener("pointercancel", onFireZonePointerCancel);
+      fireZone.remove();
 
       rockGeometry.dispose();
       rockMaterial.dispose();
