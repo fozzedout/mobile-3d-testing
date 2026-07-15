@@ -312,18 +312,22 @@ body {
   left: var(--safe-left);
   bottom: var(--safe-bottom);
   z-index: 25;
-  width: 92px;
-  height: 92px;
-  /* Rounded only on the outer corner (away from the screen edges) so it reads
-     as tucked into the corner rather than a block sitting mid-edge. */
-  border-radius: 0 28px 0 0;
+  width: 120px;
+  height: 120px;
+  /* clip-path (not just border-radius) carves the actual hit-test region,
+     not only the paint — a right triangle hugging the corner, wide along
+     both physical edges and tapering to a point away from them, so the
+     shape gives back as much of the move stick's area as it can while the
+     corner itself (the part you actually aim for by feel) stays full-size. */
+  clip-path: polygon(0 0, 100% 100%, 0 100%);
   border: 2px solid #ff6b6b;
   background: rgba(255, 60, 60, 0.12);
   color: #ffecec;
   display: flex;
-  align-items: center;
-  justify-content: center;
-  text-align: center;
+  align-items: flex-end;
+  justify-content: flex-start;
+  padding: 0 0 14px 14px;
+  text-align: left;
   font-weight: 600;
   font-size: 12px;
   line-height: 1.35;
