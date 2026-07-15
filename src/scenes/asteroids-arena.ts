@@ -202,9 +202,10 @@ function setup(ctx: SceneContext): SceneInstance {
   // edges always lands on it, no need to look. Thumb-sized rather than a big
   // block, since the move stick can spawn wherever it's first touched in the
   // left half; the only real cost to "in the way" is this zone's footprint,
-  // so it stays only as big as it needs to be. A quick tap fires once; a
-  // swipe (up to arm, down to disarm) toggles auto-fire so the thumb can
-  // leave the zone entirely and keep steering while the ship keeps firing.
+  // so it stays only as big as it needs to be. Holding it down fires on
+  // cooldown for as long as it's held; a swipe (up to arm, down to disarm)
+  // additionally toggles auto-fire, so the thumb can leave the zone entirely
+  // and keep steering while the ship keeps firing on its own.
   const fireZone = document.createElement("div");
   fireZone.className = "fire-zone";
   fireZone.innerHTML = '<span class="fire-zone-label">FIRE</span>';
@@ -212,6 +213,7 @@ function setup(ctx: SceneContext): SceneInstance {
   const fireZoneLabel = fireZone.querySelector(".fire-zone-label") as HTMLSpanElement;
 
   let autoFire = false;
+  let fireHeld = false;
   let fireGestureId: number | null = null;
   let fireGestureStart = { x: 0, y: 0 };
 
@@ -227,6 +229,7 @@ function setup(ctx: SceneContext): SceneInstance {
     if (fireGestureId !== null) return;
     fireGestureId = e.pointerId;
     fireGestureStart = { x: e.clientX, y: e.clientY };
+    fireHeld = true;
     // Captured so a fast swipe that overshoots this (deliberately small) box
     // keeps being tracked instead of silently handing off to whatever's
     // underneath — otherwise shrinking the target would break the gesture.
@@ -239,16 +242,17 @@ function setup(ctx: SceneContext): SceneInstance {
   const onFireZonePointerUp = (e: PointerEvent): void => {
     if (e.pointerId !== fireGestureId) return;
     fireGestureId = null;
+    fireHeld = false;
     const dx = e.clientX - fireGestureStart.x;
     const dy = e.clientY - fireGestureStart.y;
     if (Math.abs(dy) > SWIPE_THRESHOLD_PX && Math.abs(dy) > Math.abs(dx)) {
       setAutoFire(dy < 0); // swipe up arms it, swipe down disarms it
-    } else {
-      fireLaser();
     }
+    // Otherwise: a plain tap/hold already fired via fireHeld in the update loop.
   };
   const onFireZonePointerCancel = (e: PointerEvent): void => {
     if (e.pointerId === fireGestureId) fireGestureId = null;
+    fireHeld = false;
   };
   fireZone.addEventListener("pointerdown", onFireZonePointerDown);
   fireZone.addEventListener("pointerup", onFireZonePointerUp);
@@ -268,7 +272,7 @@ function setup(ctx: SceneContext): SceneInstance {
       if (state !== "countdown") rig.update(delta);
       if (fireCooldown > 0) fireCooldown -= delta;
       if (invulnerable > 0) invulnerable -= delta;
-      if (autoFire) fireLaser();
+      if (autoFire || fireHeld) fireLaser();
 
       if (state === "countdown") {
         countdownRemaining -= delta;
