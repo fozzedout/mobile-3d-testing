@@ -306,12 +306,17 @@ body {
 
 .fire-zone {
   position: fixed;
-  left: calc(var(--safe-left) + 8px);
-  bottom: calc(var(--safe-bottom) + 8px);
+  /* Flush against the actual corner (no gap) so it's findable by feel: slide
+     a thumb until it hits both the left and bottom edges and you're on it —
+     a gap here would leave a dead spot between "edge" and "target". */
+  left: var(--safe-left);
+  bottom: var(--safe-bottom);
   z-index: 25;
-  width: 150px;
-  height: 150px;
-  border-radius: 20px;
+  width: 92px;
+  height: 92px;
+  /* Rounded only on the outer corner (away from the screen edges) so it reads
+     as tucked into the corner rather than a block sitting mid-edge. */
+  border-radius: 0 28px 0 0;
   border: 2px solid #ff6b6b;
   background: rgba(255, 60, 60, 0.12);
   color: #ffecec;
@@ -320,8 +325,8 @@ body {
   justify-content: center;
   text-align: center;
   font-weight: 600;
-  font-size: 13px;
-  line-height: 1.4;
+  font-size: 12px;
+  line-height: 1.35;
   letter-spacing: 0.03em;
   touch-action: none;
   transition:

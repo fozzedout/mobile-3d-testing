@@ -197,10 +197,14 @@ function setup(ctx: SceneContext): SceneInstance {
     countdownRemaining = 3;
   }
 
-  // A big bottom-left corner zone rather than a small precise button — easy
-  // to hit without looking away from aiming. A quick tap fires once; a swipe
-  // (up to arm, down to disarm) toggles auto-fire, so the thumb can leave the
-  // zone entirely and keep steering while the ship fires on its own cooldown.
+  // Flush against the actual bottom-left corner (not floating a gap inward)
+  // so it's findable by feel — sliding a thumb until it hits both physical
+  // edges always lands on it, no need to look. Thumb-sized rather than a big
+  // block, since the move stick can spawn wherever it's first touched in the
+  // left half; the only real cost to "in the way" is this zone's footprint,
+  // so it stays only as big as it needs to be. A quick tap fires once; a
+  // swipe (up to arm, down to disarm) toggles auto-fire so the thumb can
+  // leave the zone entirely and keep steering while the ship keeps firing.
   const fireZone = document.createElement("div");
   fireZone.className = "fire-zone";
   fireZone.innerHTML = '<span class="fire-zone-label">FIRE</span>';
@@ -214,7 +218,7 @@ function setup(ctx: SceneContext): SceneInstance {
   function setAutoFire(on: boolean): void {
     autoFire = on;
     fireZone.classList.toggle("autofire", on);
-    fireZoneLabel.textContent = on ? "AUTO ON\n(swipe down to stop)" : "FIRE\n(swipe up to lock)";
+    fireZoneLabel.textContent = on ? "AUTO\n↓ stop" : "FIRE\n↑ lock";
   }
   setAutoFire(false);
 
@@ -223,6 +227,14 @@ function setup(ctx: SceneContext): SceneInstance {
     if (fireGestureId !== null) return;
     fireGestureId = e.pointerId;
     fireGestureStart = { x: e.clientX, y: e.clientY };
+    // Captured so a fast swipe that overshoots this (deliberately small) box
+    // keeps being tracked instead of silently handing off to whatever's
+    // underneath — otherwise shrinking the target would break the gesture.
+    try {
+      fireZone.setPointerCapture(e.pointerId);
+    } catch {
+      // Capture is a reliability nicety; plain event delivery still works if refused.
+    }
   };
   const onFireZonePointerUp = (e: PointerEvent): void => {
     if (e.pointerId !== fireGestureId) return;
