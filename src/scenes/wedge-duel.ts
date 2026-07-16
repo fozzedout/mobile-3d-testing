@@ -69,6 +69,10 @@ interface Fighter {
   orbitAzimuth: number; // roll of the orbit plane around the line to the player
   evadeDir: THREE.Vector3;
   evadeTimer: number;
+  /** Smoothed cosmetic bank angle (rad), applied on top of the physics quat. */
+  bankAngle: number;
+  /** Hysteresis for bank direction so appliedRotation.y noise can't flip ±max bank in one frame. */
+  bankSign: number;
 }
 
 interface Laser {
@@ -100,11 +104,18 @@ const _axis = new THREE.Vector3();
 const _targetVelocity = new THREE.Vector3();
 const _prevQuat = new THREE.Quaternion();
 const _targetQuat = new THREE.Quaternion();
+const _deltaQuat = new THREE.Quaternion();
 const _appliedRotation = new THREE.Quaternion();
 const _bankQuat = new THREE.Quaternion();
+const _prevGroupQuat = new THREE.Quaternion();
 const _laserPrev = new THREE.Vector3();
 const _ramDelta = new THREE.Vector3();
 const _pushDir = new THREE.Vector3();
+// Deadzone on the yaw component of the frame's applied rotation before we
+// accept a new bank sign — below this, sign(applied.y) is dominated by float
+// noise and will flip ±MAX_BANK in a single frame (see updateFighterAI bank).
+const BANK_SIGN_DEADZONE = 0.002;
+const BANK_SMOOTH_RATE = 14; // exp smoothing toward target bank (1/seconds)
 
 function randomDirection(): THREE.Vector3 {
   const theta = Math.random() * Math.PI * 2;
@@ -230,6 +241,11 @@ function setup(ctx: SceneContext): SceneInstance {
     lives: START_LIVES,
     kills: 0,
     best: bestScore > 0 ? String(bestScore) : "—",
+    // Last-frame visual orientation change (physics quat + cosmetic bank), in
+    // degrees — useful for catching discontinuous jumps on-device without a
+    // console. Sustained turns at the capped rate are ~1–3°/frame at 60fps;
+    // pre-fix bank flicker was hitting ~80° in a single frame.
+    rotJump: "0.0°",
   };
 
   function spawnFighter(): void {
@@ -239,7 +255,11 @@ function setup(ctx: SceneContext): SceneInstance {
     const group = buildFighterGroup();
     group.position.copy(position);
     scene.add(group);
-    const quaternion = new THREE.Quaternion().setFromUnitVectors(new THREE.Vector3(0, 0, -1), rig.position.clone().sub(position).normalize());
+    const toPlayer = rig.position.clone().sub(position).normalize();
+    const quaternion = new THREE.Quaternion().setFromUnitVectors(new THREE.Vector3(0, 0, -1), toPlayer);
+    // Apply the spawn facing to the mesh immediately — otherwise the wedge
+    // sits at identity for one frame before the first AI tick.
+    group.quaternion.copy(quaternion);
     fighter = {
       group,
       position,
@@ -254,6 +274,8 @@ function setup(ctx: SceneContext): SceneInstance {
       orbitAzimuth: Math.random() * Math.PI * 2,
       evadeDir: new THREE.Vector3(),
       evadeTimer: 0,
+      bankAngle: 0,
+      bankSign: 0,
     };
   }
 
@@ -352,9 +374,43 @@ function setup(ctx: SceneContext): SceneInstance {
 
     // Turn toward the desired heading at a bounded rate — this (not an
     // instant velocity flip) is what makes it read as a real craft.
+    //
+    // Target orientation is built by rotating the CURRENT attitude so its
+    // nose swings onto desiredDir (twist-minimizing), NOT by
+    // setFromUnitVectors(FORWARD, desiredDir) from identity. The identity
+    // construction picks an arbitrary roll around the nose; as desiredDir
+    // sweeps (especially through the antipode of FORWARD when backing off)
+    // that implied roll flips discontinuously, and rotateTowards then burns
+    // its whole turn budget on a sudden roll snap. Composing a delta from
+    // the live forward preserves the current roll and only asks for the
+    // heading change we actually want.
     _prevQuat.copy(active.quaternion);
     _prevForward.copy(FORWARD).applyQuaternion(active.quaternion);
-    _targetQuat.setFromUnitVectors(FORWARD, _desiredDir);
+    const align = _prevForward.dot(_desiredDir);
+    if (align > 0.999999) {
+      _targetQuat.copy(active.quaternion);
+    } else if (align < -0.999999) {
+      // Exactly antipodal: setFromUnitVectors' axis is undefined and flips
+      // every frame under tiny noise. Pin the 180° flip to the craft's
+      // current local up (fall back to local right if up ≈ forward).
+      _axis.set(0, 1, 0).applyQuaternion(active.quaternion);
+      if (Math.abs(_axis.dot(_prevForward)) > 0.95) {
+        _axis.set(1, 0, 0).applyQuaternion(active.quaternion);
+      }
+      _axis.normalize();
+      _targetQuat.setFromAxisAngle(_axis, Math.PI).multiply(active.quaternion);
+    } else {
+      _deltaQuat.setFromUnitVectors(_prevForward, _desiredDir);
+      _targetQuat.copy(_deltaQuat).multiply(active.quaternion);
+    }
+    // Quaternion double-cover: keep the short-arc representative so
+    // rotateTowards doesn't take the long way around.
+    if (active.quaternion.dot(_targetQuat) < 0) {
+      _targetQuat.x = -_targetQuat.x;
+      _targetQuat.y = -_targetQuat.y;
+      _targetQuat.z = -_targetQuat.z;
+      _targetQuat.w = -_targetQuat.w;
+    }
     const maxStep = THREE.MathUtils.degToRad(turnRateDeg) * delta;
     active.quaternion.rotateTowards(_targetQuat, maxStep);
     _forward.copy(FORWARD).applyQuaternion(active.quaternion);
@@ -372,20 +428,35 @@ function setup(ctx: SceneContext): SceneInstance {
     active.position.addScaledVector(active.velocity, delta);
     active.group.position.copy(active.position);
 
-    // Purely cosmetic roll into the turn, proportional to how hard it's
-    // actually turning this frame — makes the direction change legible at a
-    // glance instead of just a slowly reorienting nose. Sign comes from the
-    // rotation actually just applied (not a separately-recomputed direction
-    // toward the ever-shifting desiredDir), which was flickering: near
-    // alignment a fresh cross product each frame flips sign on tiny noise
-    // even though no real turn was happening.
-    const turnRateNow = delta > 0 ? turnedAngle / delta : 0;
+    // Purely cosmetic roll into the turn. Two things used to make this look
+    // like an instant orientation jump even when the physics quat was fine:
+    //
+    // 1. bankSign = sign(appliedRotation.y) with no deadzone — near zero the
+    //    sign flips on float noise every other frame.
+    // 2. bankFraction saturates to 1 whenever the craft is turning at its
+    //    capped rate (the normal case), so a sign flip slammed the mesh
+    //    between +MAX_BANK and -MAX_BANK (~84°) in a single frame.
+    //
+    // Hysteresis on the sign + exponential smoothing on the angle keeps the
+    // bank readable without discontinuous snaps. Target bank goes to 0 when
+    // we aren't actually turning.
+    _prevGroupQuat.copy(active.group.quaternion);
     _appliedRotation.copy(_prevQuat).invert().multiply(active.quaternion);
-    const bankSign = Math.sign(_appliedRotation.y) || 0;
+    if (_appliedRotation.y > BANK_SIGN_DEADZONE) active.bankSign = 1;
+    else if (_appliedRotation.y < -BANK_SIGN_DEADZONE) active.bankSign = -1;
+    const turnRateNow = delta > 0 ? turnedAngle / delta : 0;
     const bankFraction = THREE.MathUtils.clamp(turnRateNow / THREE.MathUtils.degToRad(active.turnRate), 0, 1);
-    const bankAngle = bankFraction * THREE.MathUtils.degToRad(FIGHTER_MAX_BANK_DEG) * bankSign;
-    _bankQuat.setFromAxisAngle(ROLL_AXIS, bankAngle);
+    const targetBank =
+      turnedAngle < 1e-5 ? 0 : bankFraction * THREE.MathUtils.degToRad(FIGHTER_MAX_BANK_DEG) * active.bankSign;
+    const bankBlend = 1 - Math.exp(-delta * BANK_SMOOTH_RATE);
+    active.bankAngle += (targetBank - active.bankAngle) * bankBlend;
+    _bankQuat.setFromAxisAngle(ROLL_AXIS, active.bankAngle);
     active.group.quaternion.copy(active.quaternion).multiply(_bankQuat);
+
+    // Surface the visual Δ so on-device play can confirm jumps are gone
+    // without digging through a console (see readout.rotJump).
+    const visualJumpDeg = THREE.MathUtils.radToDeg(_prevGroupQuat.angleTo(active.group.quaternion));
+    readout.rotJump = `${visualJumpDeg.toFixed(1)}°`;
 
     if (active.fireCooldown > 0) active.fireCooldown -= delta;
     if (active.fireCooldown <= 0 && dist <= FIGHTER_FIRE_RANGE && active.evadeTimer <= 0 && _forward.dot(_toPlayerDir) >= FIGHTER_FIRE_ALIGNMENT_MIN) {
@@ -475,6 +546,7 @@ function setup(ctx: SceneContext): SceneInstance {
   gui.add(readout, "lives").name("Lives").listen().disable();
   gui.add(readout, "kills").name("Kills").listen().disable();
   gui.add(readout, "best").name("Best score").listen().disable();
+  gui.add(readout, "rotJump").name("Rot jump (frame)").listen().disable();
   gui.add({ restart }, "restart").name("Restart");
 
   return {
@@ -550,7 +622,8 @@ function setup(ctx: SceneContext): SceneInstance {
           _ramDelta.subVectors(rig.position, fighter.position);
           const contact = FIGHTER_RADIUS + SHIP_RADIUS;
           if (_ramDelta.lengthSq() < contact * contact) {
-            _pushDir.copy(_ramDelta).normalize();
+            if (_ramDelta.lengthSq() > 1e-8) _pushDir.copy(_ramDelta).normalize();
+            else _pushDir.set(0, 0, 1);
             loseLife(_pushDir);
             damageFighter(fighter);
           }
