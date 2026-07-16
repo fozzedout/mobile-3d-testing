@@ -88,4 +88,10 @@ export const sceneRegistry: SceneMeta[] = [
     description: "Assemble reactors, engines, weapons and cargo on a 3D grid — hull stretches to fit, stats update live.",
     load: () => import("./ship-designer.ts").then((m) => m.shipDesignerScene),
   },
+  {
+    id: "docking-bay",
+    name: "Course: Docking Bay",
+    description: "Timed docking at a spinning voxel station — enter the rotating slot, land on the pad, take off and exit clean.",
+    load: () => import("./docking-bay.ts").then((m) => m.dockingBayScene),
+  },
 ];
