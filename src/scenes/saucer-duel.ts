@@ -5,6 +5,7 @@ import { FlightRig } from "../core/flight-rig.ts";
 import { HitFlash } from "../core/hit-flash.ts";
 import { FireZone } from "../core/fire-zone.ts";
 import { buildStarfield } from "../core/starfield.ts";
+import { segmentHitsSphere } from "../core/swept-hit.ts";
 
 const SHIP_RADIUS = 3;
 const LASER_SPEED = 220;
@@ -70,6 +71,22 @@ function randomDirection(): THREE.Vector3 {
   const phi = Math.acos(2 * Math.random() - 1);
   return new THREE.Vector3(Math.sin(phi) * Math.cos(theta), Math.sin(phi) * Math.sin(theta), Math.cos(phi));
 }
+
+// Scratch objects reused every frame instead of allocating fresh Vector3s —
+// each is written immediately before it's read and never escapes past that
+// use, so sharing them at module scope is safe on this single-threaded loop.
+// Anything that gets stored as persistent per-saucer state (evadeDir,
+// strafeDir) still gets its own `new THREE.Vector3()` — see the comments at
+// those call sites.
+const WORLD_UP = new THREE.Vector3(0, 1, 0);
+const playerLaserFrom = new THREE.Vector3();
+const enemyLaserFrom = new THREE.Vector3();
+const aiToPlayer = new THREE.Vector3();
+const aiToPlayerDir = new THREE.Vector3();
+const aiRel = new THREE.Vector3();
+const aiClosest = new THREE.Vector3();
+const aiDesired = new THREE.Vector3();
+const ramPushDir = new THREE.Vector3();
 
 /**
  * A one-on-one duel against a single flying saucer: it holds a rough standoff
@@ -195,22 +212,26 @@ function setup(ctx: SceneContext): SceneInstance {
   }
 
   function updateSaucerAI(active: Saucer, delta: number): void {
-    const toPlayer = rig.position.clone().sub(active.position);
-    const dist = toPlayer.length();
-    const toPlayerDir = dist > 0.0001 ? toPlayer.clone().normalize() : new THREE.Vector3(0, 0, -1);
+    aiToPlayer.subVectors(rig.position, active.position);
+    const dist = aiToPlayer.length();
+    const toPlayerDir = dist > 0.0001 ? aiToPlayerDir.copy(aiToPlayer).normalize() : aiToPlayerDir.set(0, 0, -1);
 
     if (active.evadeTimer <= 0) {
       for (const laser of playerLasers) {
         const speed2 = laser.velocity.lengthSq();
         if (speed2 < 1e-6) continue;
-        const rel = active.position.clone().sub(laser.mesh.position);
-        const t = THREE.MathUtils.clamp(rel.dot(laser.velocity) / speed2, 0, SAUCER_EVADE_LOOKAHEAD);
-        const closestPoint = laser.mesh.position.clone().addScaledVector(laser.velocity, t);
-        if (closestPoint.distanceTo(active.position) < SAUCER_EVADE_RADIUS) {
-          const lateral = new THREE.Vector3().crossVectors(laser.velocity, new THREE.Vector3(0, 1, 0));
+        aiRel.subVectors(active.position, laser.mesh.position);
+        const t = THREE.MathUtils.clamp(aiRel.dot(laser.velocity) / speed2, 0, SAUCER_EVADE_LOOKAHEAD);
+        aiClosest.copy(laser.mesh.position).addScaledVector(laser.velocity, t);
+        if (aiClosest.distanceTo(active.position) < SAUCER_EVADE_RADIUS) {
+          // Assigned to active.evadeDir below (persistent per-saucer state
+          // read again next frame), so this must stay its own allocation
+          // rather than a reused scratch object.
+          const lateral = new THREE.Vector3().crossVectors(laser.velocity, WORLD_UP);
           if (lateral.lengthSq() < 1e-6) lateral.set(1, 0, 0);
           lateral.normalize();
-          const side = active.position.clone().sub(closestPoint).dot(lateral) < 0 ? -1 : 1;
+          aiRel.subVectors(active.position, aiClosest); // rel's earlier value is no longer needed; reused for the side test
+          const side = aiRel.dot(lateral) < 0 ? -1 : 1;
           active.evadeDir = lateral.multiplyScalar(side);
           active.evadeTimer = SAUCER_EVADE_DURATION;
           break;
@@ -218,14 +239,16 @@ function setup(ctx: SceneContext): SceneInstance {
       }
     }
 
-    let desired: THREE.Vector3;
     if (active.evadeTimer > 0) {
       active.evadeTimer -= delta;
-      desired = active.evadeDir ? active.evadeDir.clone().multiplyScalar(active.maxSpeed) : new THREE.Vector3();
+      if (active.evadeDir) aiDesired.copy(active.evadeDir).multiplyScalar(active.maxSpeed);
+      else aiDesired.set(0, 0, 0);
     } else {
       active.strafeTimer -= delta;
       if (active.strafeTimer <= 0) {
-        const lateral = new THREE.Vector3().crossVectors(toPlayerDir, new THREE.Vector3(0, 1, 0));
+        // Assigned to active.strafeDir below (persistent per-saucer state),
+        // same reasoning as the evadeDir lateral above.
+        const lateral = new THREE.Vector3().crossVectors(toPlayerDir, WORLD_UP);
         if (lateral.lengthSq() < 1e-6) lateral.set(1, 0, 0);
         lateral.normalize().multiplyScalar(Math.random() < 0.5 ? 1 : -1);
         active.strafeDir = lateral;
@@ -234,11 +257,12 @@ function setup(ctx: SceneContext): SceneInstance {
       let radial = 0;
       if (dist < SAUCER_MIN_RANGE) radial = -1;
       else if (dist > SAUCER_MAX_RANGE) radial = 1;
-      const combo = toPlayerDir.clone().multiplyScalar(radial * 0.9).add(active.strafeDir.clone().multiplyScalar(0.8));
-      desired = combo.lengthSq() > 1e-6 ? combo.normalize().multiplyScalar(active.maxSpeed) : new THREE.Vector3();
+      aiDesired.copy(toPlayerDir).multiplyScalar(radial * 0.9).addScaledVector(active.strafeDir, 0.8);
+      if (aiDesired.lengthSq() > 1e-6) aiDesired.normalize().multiplyScalar(active.maxSpeed);
+      else aiDesired.set(0, 0, 0);
     }
 
-    active.velocity.lerp(desired, 1 - Math.pow(0.001, delta));
+    active.velocity.lerp(aiDesired, 1 - Math.pow(0.001, delta));
     active.position.addScaledVector(active.velocity, delta);
     active.group.position.copy(active.position);
     active.group.lookAt(rig.position);
@@ -278,13 +302,12 @@ function setup(ctx: SceneContext): SceneInstance {
     }
   }
 
-  function loseLife(fromLaser: Laser): void {
+  function loseLife(pushDir: THREE.Vector3): void {
     if (invulnerable > 0) return;
     lives -= 1;
     readout.lives = lives;
     invulnerable = INVULN_SECONDS;
     hitFlash.trigger();
-    const pushDir = fromLaser.velocity.clone().normalize();
     rig.position.addScaledVector(pushDir, 4);
     const into = rig.velocity.dot(pushDir);
     if (into < 0) rig.velocity.addScaledVector(pushDir, -into);
@@ -356,6 +379,10 @@ function setup(ctx: SceneContext): SceneInstance {
       if (state === "playing") {
         for (let i = playerLasers.length - 1; i >= 0; i--) {
           const laser = playerLasers[i];
+          // Point-sampling the post-move position can tunnel through the
+          // saucer on a slow frame (220 u/s covers more ground per frame than
+          // SAUCER_RADIUS) — sweep the segment travelled this frame instead.
+          playerLaserFrom.copy(laser.mesh.position);
           laser.mesh.position.addScaledVector(laser.velocity, delta);
           laser.age += delta;
           if (laser.age > LASER_LIFETIME) {
@@ -363,7 +390,7 @@ function setup(ctx: SceneContext): SceneInstance {
             playerLasers.splice(i, 1);
             continue;
           }
-          if (saucer && laser.mesh.position.distanceTo(saucer.position) < SAUCER_RADIUS) {
+          if (saucer && segmentHitsSphere(playerLaserFrom, laser.mesh.position, saucer.position, SAUCER_RADIUS)) {
             scene.remove(laser.mesh);
             playerLasers.splice(i, 1);
             damageSaucer(saucer);
@@ -372,6 +399,7 @@ function setup(ctx: SceneContext): SceneInstance {
 
         for (let i = enemyLasers.length - 1; i >= 0; i--) {
           const laser = enemyLasers[i];
+          enemyLaserFrom.copy(laser.mesh.position); // same tunneling concern as the player lasers above
           laser.mesh.position.addScaledVector(laser.velocity, delta);
           laser.age += delta;
           if (laser.age > SAUCER_LASER_LIFETIME) {
@@ -379,11 +407,23 @@ function setup(ctx: SceneContext): SceneInstance {
             enemyLasers.splice(i, 1);
             continue;
           }
-          if (invulnerable <= 0 && laser.mesh.position.distanceTo(rig.position) < SHIP_RADIUS + 1.2) {
+          if (invulnerable <= 0 && segmentHitsSphere(enemyLaserFrom, laser.mesh.position, rig.position, SHIP_RADIUS + 1.2)) {
             scene.remove(laser.mesh);
             enemyLasers.splice(i, 1);
-            loseLife(laser);
+            loseLife(laser.velocity.clone().normalize());
           }
+        }
+
+        // Ramming costs both sides: no dedicated projectile involved, so this
+        // isn't covered by the swept laser checks above. Gated by invulnerable
+        // the same way a laser hit is, so it can't re-trigger every frame
+        // while the two are overlapping.
+        if (saucer && invulnerable <= 0 && saucer.position.distanceTo(rig.position) < SAUCER_RADIUS + SHIP_RADIUS) {
+          ramPushDir.subVectors(rig.position, saucer.position);
+          if (ramPushDir.lengthSq() > 1e-8) ramPushDir.normalize();
+          else ramPushDir.set(0, 0, 1);
+          loseLife(ramPushDir);
+          damageSaucer(saucer);
         }
 
         if (saucer) {
