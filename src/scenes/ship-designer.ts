@@ -9,6 +9,7 @@ const CELL = 4;
 type ModuleType = "reactor" | "engine" | "fuel" | "weapon" | "shield" | "cargo" | "crew";
 type ViewMode = "internal" | "exterior" | "performance";
 type PrefabName = "fighter" | "trader";
+type HullStyle = "plated" | "box";
 // "idle" = nothing pending; "move" = a selected module is waiting for a destination tap;
 // "add" = a palette/duplicate module is waiting to be placed on a tap.
 type EditMode = "idle" | "move" | "add";
@@ -184,6 +185,7 @@ function setup(ctx: SceneContext): SceneInstance {
     prefab: "fighter" as PrefabName,
     paletteType: "cargo" as ModuleType,
     hullColor: "#5a6b8c",
+    hullStyle: "plated" as HullStyle,
   };
   const readout = { status: "OK — layout valid" };
   const perf = {
@@ -449,15 +451,57 @@ function setup(ctx: SceneContext): SceneInstance {
 
   // ---- generated exterior hull ------------------------------------------------------
   function disposeHullMeshes(): void {
+    // The plated style shares one geometry across many meshes — collect into a
+    // set first so nothing gets double-disposed.
+    const geometries = new Set<THREE.BufferGeometry>();
     for (const child of hullGroup.children) {
-      if (child instanceof THREE.Mesh) child.geometry.dispose();
+      if (child instanceof THREE.Mesh) geometries.add(child.geometry);
     }
+    for (const g of geometries) g.dispose();
     hullGroup.clear();
+  }
+  function addEngineNozzles(rearZFor: (m: Module) => number): void {
+    // A short nozzle protruding from the rear at each engine's (x,y) — the
+    // hull visibly reflects the propulsion layout, whichever style is on.
+    const nozzleLen = 0.9 * CELL;
+    const nozzleGeometry = new THREE.CylinderGeometry(0.35 * CELL, 0.35 * CELL, nozzleLen, 12);
+    for (const m of modules) {
+      if (m.type !== "engine") continue;
+      const nozzle = new THREE.Mesh(nozzleGeometry, nozzleMaterial);
+      nozzle.rotation.x = Math.PI / 2; // align cylinder's y axis with +z
+      nozzle.position.set(cellX(m.x), cellY(m.y), rearZFor(m) + nozzleLen / 2 - 0.1);
+      hullGroup.add(nozzle);
+    }
   }
   function buildHull(): void {
     disposeHullMeshes();
     if (modules.length === 0) return;
-
+    if (state.hullStyle === "plated") buildPlatedHull();
+    else buildBoxHull();
+  }
+  // Form-fitting "skin": one slightly-inflated armor plate per occupied cell
+  // that has at least one exposed face, so the hull silhouette IS the module
+  // layout (an arrowhead fighter reads as an arrowhead, a cargo spine reads
+  // as a slab). Plates overlap their neighbors, which welds them into a
+  // chunky low-poly sheet-metal shell; overlapping coplanar faces share the
+  // same material and normal so they light identically — no shimmer.
+  function buildPlatedHull(): void {
+    const plateGeometry = new THREE.BoxGeometry(CELL * 1.3, CELL * 1.3, CELL * 1.3);
+    for (const m of modules) {
+      const enclosed =
+        occupantAt(m.x + 1, m.y, m.z) && occupantAt(m.x - 1, m.y, m.z) &&
+        occupantAt(m.x, m.y + 1, m.z) && occupantAt(m.x, m.y - 1, m.z) &&
+        occupantAt(m.x, m.y, m.z + 1) && occupantAt(m.x, m.y, m.z - 1);
+      if (enclosed) continue; // fully interior — its plate would never be seen
+      const plate = new THREE.Mesh(plateGeometry, hullMaterial);
+      plate.position.set(cellX(m.x), cellY(m.y), cellZ(m.z));
+      hullGroup.add(plate);
+    }
+    addEngineNozzles((m) => cellZ(m.z) + (CELL * 1.3) / 2);
+  }
+  // The original single-shell alternative, kept for comparison: an inflated
+  // box over the installed modules' bounding volume with a cone nose.
+  function buildBoxHull(): void {
     // Bounding box of the INSTALLED modules — this is why the hull visibly re-fits when
     // modules are added, moved or removed.
     let minX = Infinity, minY = Infinity, minZ = Infinity;
@@ -487,16 +531,8 @@ function setup(ctx: SceneContext): SceneInstance {
     nose.position.set(cx, cy, cz - sz / 2 - noseLen / 2);
     hullGroup.add(nose);
 
-    // A short nozzle protruding from the rear (+z) face at each engine's (x,y).
-    const nozzleLen = 0.9 * CELL;
     const rearZ = cz + sz / 2;
-    for (const m of modules) {
-      if (m.type !== "engine") continue;
-      const nozzle = new THREE.Mesh(new THREE.CylinderGeometry(0.35 * CELL, 0.35 * CELL, nozzleLen, 12), nozzleMaterial);
-      nozzle.rotation.x = Math.PI / 2; // align cylinder's y axis with +z
-      nozzle.position.set(cellX(m.x), cellY(m.y), rearZ + nozzleLen / 2 - 0.1);
-      hullGroup.add(nozzle);
-    }
+    addEngineNozzles(() => rearZ);
   }
 
   // ---- view + camera ----------------------------------------------------------------
@@ -735,6 +771,12 @@ function setup(ctx: SceneContext): SceneInstance {
   gui.add(state, "prefab", ["fighter", "trader"]).name("Prefab");
   gui.add(actions, "loadPrefab").name("Load prefab");
   const hullColorCtrl = gui.addColor(state, "hullColor").name("Hull color").onChange((v: string) => hullMaterial.color.set(v));
+  gui
+    .add(state, "hullStyle", ["plated", "box"])
+    .name("Hull style")
+    .onChange(() => {
+      if (state.view === "exterior") buildHull();
+    });
   gui.add(actions, "repair").name("Repair layout");
   gui.add(readout, "status").name("Status").listen().disable();
 
