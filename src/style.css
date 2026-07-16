@@ -377,3 +377,116 @@ body {
     --width: min(280px, calc(100vw - 16px));
   }
 }
+
+/* Ship-designer touch UI: a bottom palette bar (always visible while editing) and a
+   selection action bar stacked just above it. Both sit below lil-gui (z-index 26),
+   are safe-area padded, and take their pointer events so drags/taps land on the bar. */
+.ship-palette {
+  position: fixed;
+  left: 50%;
+  bottom: calc(var(--safe-bottom) + 12px);
+  transform: translateX(-50%);
+  z-index: 26;
+  display: flex;
+  align-items: center;
+  gap: 6px;
+  max-width: calc(100vw - 16px);
+  padding: 8px;
+  background: rgba(20, 22, 28, 0.9);
+  border: 1px solid #2b2f3a;
+  border-radius: 12px;
+  backdrop-filter: blur(6px);
+  pointer-events: auto;
+  /* The palette buttons initiate a drag — no browser scroll/zoom should steal it. */
+  touch-action: none;
+}
+
+.ship-pal-btn {
+  width: 48px;
+  height: 48px;
+  padding: 0;
+  border: 1px solid #2b2f3a;
+  border-radius: 8px;
+  background-color: #14161c;
+  background-size: cover;
+  background-position: center;
+  background-repeat: no-repeat;
+}
+
+.ship-pal-btn:active {
+  border-color: #43f08a;
+}
+
+.ship-pal-size {
+  width: 48px;
+  height: 48px;
+  margin-left: 4px;
+  border: 1px solid #2b2f3a;
+  border-radius: 8px;
+  background: #1a1d24;
+  color: #eef1f6;
+  font-size: 16px;
+  font-weight: 700;
+  font-variant-numeric: tabular-nums;
+}
+
+.ship-pal-size:active {
+  background: #2b2f3a;
+}
+
+.ship-actions {
+  position: fixed;
+  left: 50%;
+  /* Sits above the palette bar (palette height 64px + a gap). */
+  bottom: calc(var(--safe-bottom) + 12px + 72px);
+  transform: translateX(-50%);
+  z-index: 26;
+  display: flex;
+  align-items: center;
+  gap: 8px;
+  max-width: calc(100vw - 16px);
+  padding: 8px 10px;
+  background: rgba(20, 22, 28, 0.9);
+  border: 1px solid #2b2f3a;
+  border-radius: 12px;
+  backdrop-filter: blur(6px);
+  pointer-events: auto;
+  touch-action: none;
+}
+
+.ship-actions-label {
+  font-size: 13px;
+  color: #9aa2b1;
+  white-space: nowrap;
+  padding: 0 4px;
+  /* The label is the only shrinkable element — buttons must keep their full
+     touch size, so on a narrow phone the label truncates rather than pushing
+     the last button off-screen. */
+  flex: 0 1 auto;
+  min-width: 0;
+  overflow: hidden;
+  text-overflow: ellipsis;
+}
+
+.ship-act-btn {
+  flex: none;
+  min-width: 48px;
+  min-height: 48px;
+  padding: 0 10px;
+  border: 1px solid #2b2f3a;
+  border-radius: 8px;
+  background: #1a1d24;
+  color: #eef1f6;
+  font-size: 14px;
+  white-space: nowrap;
+}
+
+.ship-act-btn:active {
+  background: #2b2f3a;
+}
+
+/* Toggled by the scene to hide a bar (exterior view / no selection). Author-level
+   !important so it wins over the bars' own display:flex. */
+.ship-hidden {
+  display: none !important;
+}

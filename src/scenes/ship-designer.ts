@@ -1,30 +1,28 @@
 import * as THREE from "three";
 import type { SceneContext, SceneInstance, TestScene } from "./types.ts";
 
-// One grid cell is 4 world units on a side; the grid is centered on the origin so
-// cell (x,y,z) sits at ((x-(w-1)/2)*CELL, (y-(h-1)/2)*CELL, (z-(d-1)/2)*CELL).
+// One grid cell is 4 world units on a side. Space is an UNBOUNDED integer lattice:
+// cell (x,y,z) sits at world (x*CELL, y*CELL, z*CELL) and coords may go negative. There
+// are no w×h×d walls anymore — a design grows by attaching one block to the face of
+// another (see the drag flow), so the only structure is the modules themselves.
 // +z is the REAR of the ship (engines exhaust that way); -z is the nose.
 const CELL = 4;
 
 type ModuleType = "reactor" | "engine" | "fuel" | "weapon" | "shield" | "cargo" | "crew";
-// Set-piece module sizes. Orientations are FIXED — the long axis always runs along z
-// (the ship's nose-to-tail axis) and the wide axis along x — so there is no rotation UI.
-// Fixed orientations keep v1's tap-only editing flow simple (a single anchor tap fully
-// determines placement); rotation returns when it earns its place. Footprints in cells:
-// S = 1 cell, M = 2 (1x1x2), L = 4 (2x1x2), XL = 8 (2x2x2).
+// Set-piece module sizes. A module also carries a LIVE footprint (dx,dy,dz); ROTATION
+// yaws it by swapping dx<->dz (dy is untouched — yaw only in v2). SIZE_DIMS is just the
+// unrotated default. S and XL are cubes, so their rotation is a visual no-op (fine).
+// Footprints in cells: S = 1, M = 2 (1x1x2), L = 4 (2x1x2), XL = 8 (2x2x2).
 type ModuleSize = "S" | "M" | "L" | "XL";
 type ViewMode = "internal" | "exterior" | "performance";
 type PrefabName = "fighter" | "trader";
 type HullStyle = "plated" | "box";
-// "idle" = nothing pending; "move" = a selected module is waiting for a destination tap;
-// "add" = a palette/duplicate module is waiting to be placed on a tap.
-type EditMode = "idle" | "move" | "add";
 
 const MODULE_TYPES: ModuleType[] = ["reactor", "engine", "fuel", "weapon", "shield", "cargo", "crew"];
 const MODULE_SIZES: ModuleSize[] = ["S", "M", "L", "XL"];
 
 // Footprint dims (dx, dy, dz) in cells for each size. dx = width (x), dy = height (y),
-// dz = length (z). Long axis along z, wide axis along x, per the fixed-orientation rule.
+// dz = length (z). This is the unrotated default; rotation swaps dx and dz per-module.
 const SIZE_DIMS: Record<ModuleSize, [number, number, number]> = {
   S: [1, 1, 1],
   M: [1, 1, 2],
@@ -71,22 +69,17 @@ interface Cell {
 }
 
 interface PrefabDef {
-  w: number;
-  h: number;
-  d: number;
   hullColor: string;
   modules: (Cell & { type: ModuleType })[];
 }
 
 // Both prefabs are hand-authored to validate clean under every rule below. Every module
 // is size "S": the prefab stats are regression baselines (fighter mass 42 / speed 34.3 /
-// power balance 1; trader mass 78 / cargo 80) and must not shift when sizes were added.
+// power balance 1; trader mass 78 / cargo 80) and must not shift. Authored coords are
+// arbitrary (loadPrefab re-centers them on the origin), only their relative layout matters.
 const PREFABS: Record<PrefabName, PrefabDef> = {
   // Fighter: excellent movement (3 engines / low mass), no cargo, tight power budget.
   fighter: {
-    w: 3,
-    h: 2,
-    d: 4,
     hullColor: "#5a6b8c",
     modules: [
       { type: "crew", x: 1, y: 0, z: 0 },
@@ -101,9 +94,6 @@ const PREFABS: Record<PrefabName, PrefabDef> = {
   },
   // Trader: basic guns, decent cargo, moderate movement (heavy, only 2 engines).
   trader: {
-    w: 4,
-    h: 2,
-    d: 5,
     hullColor: "#7a6a55",
     modules: [
       { type: "weapon", x: 0, y: 0, z: 0 },
@@ -127,7 +117,7 @@ interface Module {
   type: ModuleType;
   size: ModuleSize;
   // Anchor = the module's minimum corner cell; the footprint occupies
-  // [x, x+dx) x [y, y+dy) x [z, z+dz). dims are derived from size at creation.
+  // [x, x+dx) x [y, y+dy) x [z, z+dz). dims start from size and mutate on rotation.
   x: number;
   y: number;
   z: number;
@@ -135,28 +125,19 @@ interface Module {
   dy: number;
   dz: number;
   mesh: THREE.Mesh;
-  // Each module owns its material: validity red-tint, selection glow and the
-  // performance heat-lerp are all per-module, so a shared per-type material can't
-  // express them. The BoxGeometry (one per size) and the icon texture (one per
+  // Each module owns its material: validity red-tint, selection glow, drag preview tint
+  // and the performance heat-lerp are all per-module, so a shared per-type material can't
+  // express them. The BoxGeometry (one per dims triple) and the icon texture (one per
   // type+size) are, by contrast, shared across every matching module.
   material: THREE.MeshStandardMaterial;
 }
-
-// Local box corners / edges, reused to stamp a wireframe outline into every grid cell.
-const BOX_CORNERS: THREE.Vector3Tuple[] = [
-  [-1, -1, -1], [1, -1, -1], [1, -1, 1], [-1, -1, 1],
-  [-1, 1, -1], [1, 1, -1], [1, 1, 1], [-1, 1, 1],
-];
-const BOX_EDGES: [number, number][] = [
-  [0, 1], [1, 2], [2, 3], [3, 0],
-  [4, 5], [5, 6], [6, 7], [7, 4],
-  [0, 4], [1, 5], [2, 6], [3, 7],
-];
 
 const RED = new THREE.Color("#ff3b3b");
 
 // The six orthogonal neighbor directions, shared by adjacency / connectivity scans.
 const DIRS: THREE.Vector3Tuple[] = [[1, 0, 0], [-1, 0, 0], [0, 1, 0], [0, -1, 0], [0, 0, 1], [0, 0, -1]];
+
+const clampInt = (v: number, lo: number, hi: number): number => Math.max(lo, Math.min(hi, v));
 
 // ---- pictographic icon textures ------------------------------------------------------
 // Module colors alone are unreadable on a phone, so every block wears a white
@@ -164,6 +145,7 @@ const DIRS: THREE.Vector3Tuple[] = [[1, 0, 0], [-1, 0, 0], [0, 1, 0], [0, -1, 0]
 // with canvas 2D paths — NOT emoji/text — because emoji rendering varies across
 // platforms. One 128x128 texture per (type, size); the size label is stamped in the
 // corner. A soft dark shadow backs the white strokes so they read on light tiles too.
+// The palette bar reuses these same canvases via toDataURL(), so buttons match the blocks.
 function drawGlyph(g: CanvasRenderingContext2D, type: ModuleType): void {
   g.strokeStyle = "#ffffff";
   g.fillStyle = "#ffffff";
@@ -297,11 +279,10 @@ function setup(ctx: SceneContext): SceneInstance {
   scene.background = new THREE.Color("#0a0d14");
   // The shared scene carries a default near-range fog (far 30) sized for the
   // small demo scenes — this editor's camera orbits at ~50+ units, which
-  // would put the whole grid past the fog's far plane and render it as pure
-  // fog color. No fog wanted in an editor anyway.
+  // would put the whole ship past the fog's far plane. No fog wanted in an editor.
   scene.fog = null;
-  // Editor scene: OrbitControls stay ENABLED so a one-finger drag orbits the ship;
-  // short, low-movement taps do the editing (see the pointer handlers below).
+  // Editor scene: OrbitControls orbit on an empty-space drag; a drag that starts on a
+  // block instead moves that block (controls are disabled for that pointer, see below).
   controls.enabled = true;
 
   // ---- persistent resources (created once, disposed once at teardown) -------------
@@ -313,26 +294,17 @@ function setup(ctx: SceneContext): SceneInstance {
   dirLight.position.set(20, 30, 10);
   scene.add(ambient, dirLight);
 
-  // One box geometry per size, shared across every module of that size; likewise one
-  // slightly larger box per size for the placement ghosts. Both caches are disposed at
-  // teardown (modules only own/dispose their material, never the shared geometry).
-  const moduleGeomCache = new Map<ModuleSize, THREE.BoxGeometry>();
-  const ghostGeomCache = new Map<ModuleSize, THREE.BoxGeometry>();
-  function moduleGeometryFor(size: ModuleSize): THREE.BoxGeometry {
-    let g = moduleGeomCache.get(size);
+  // One box geometry per FOOTPRINT DIMS triple (dims, not size, because rotation gives a
+  // module a footprint its size's default doesn't have), shared across every module of
+  // those dims. Disposed at teardown; modules only own/dispose their material.
+  const moduleGeomCache = new Map<string, THREE.BoxGeometry>();
+  const dimsKey = (dx: number, dy: number, dz: number): string => `${dx}x${dy}x${dz}`;
+  function moduleGeometryFor(dx: number, dy: number, dz: number): THREE.BoxGeometry {
+    const key = dimsKey(dx, dy, dz);
+    let g = moduleGeomCache.get(key);
     if (!g) {
-      const [dx, dy, dz] = SIZE_DIMS[size];
       g = new THREE.BoxGeometry(dx * CELL * 0.86, dy * CELL * 0.86, dz * CELL * 0.86);
-      moduleGeomCache.set(size, g);
-    }
-    return g;
-  }
-  function ghostGeometryFor(size: ModuleSize): THREE.BoxGeometry {
-    let g = ghostGeomCache.get(size);
-    if (!g) {
-      const [dx, dy, dz] = SIZE_DIMS[size];
-      g = new THREE.BoxGeometry(dx * CELL * 0.92, dy * CELL * 0.92, dz * CELL * 0.92);
-      ghostGeomCache.set(size, g);
+      moduleGeomCache.set(key, g);
     }
     return g;
   }
@@ -345,47 +317,31 @@ function setup(ctx: SceneContext): SceneInstance {
       iconTextures.set(iconKey(type, size), makeIconTexture(type, size));
     }
   }
+  // Data-URL of an icon's baked canvas, so a DOM button can wear the exact same tile.
+  const iconDataURL = (type: ModuleType, size: ModuleSize): string =>
+    (iconTextures.get(iconKey(type, size))!.image as HTMLCanvasElement).toDataURL();
 
-  const highlightMaterial = new THREE.MeshBasicMaterial({
-    color: "#43f08a",
-    transparent: true,
-    opacity: 0.3,
-    depthWrite: false,
-  });
-  const gridMaterial = new THREE.LineBasicMaterial({ color: "#28324d", transparent: true, opacity: 0.8 });
   const hullMaterial = new THREE.MeshStandardMaterial({ color: "#5a6b8c", flatShading: true, metalness: 0.2, roughness: 0.7 });
   const nozzleMaterial = new THREE.MeshStandardMaterial({ color: "#2b2f38", metalness: 0.5, roughness: 0.5 });
 
-  const gridLines = new THREE.LineSegments(new THREE.BufferGeometry(), gridMaterial);
   const moduleGroup = new THREE.Group();
-  const highlightGroup = new THREE.Group();
   const hullGroup = new THREE.Group();
-  root.add(gridLines, moduleGroup, highlightGroup, hullGroup);
+  root.add(moduleGroup, hullGroup);
 
-  // ---- mutable grid + layout state --------------------------------------------------
-  let w = 3;
-  let h = 2;
-  let d = 4;
+  // ---- mutable layout state ---------------------------------------------------------
   const modules: Module[] = [];
   const offending = new Set<Module>(); // modules that break a rule; get the red tint.
   let selected: Module | null = null;
-  let mode: EditMode = "idle";
-  let pendingType: ModuleType | null = null; // module type awaiting placement in "add" mode.
-  let pendingSize: ModuleSize | null = null; // module size awaiting placement in "add" mode.
-
-  const highlightMeshes: THREE.Mesh[] = [];
-  const highlightMap = new Map<THREE.Object3D, Cell>(); // ghost mesh -> placement anchor.
   const meshToModule = new Map<THREE.Object3D, Module>();
 
   const state = {
     view: "internal" as ViewMode,
     prefab: "fighter" as PrefabName,
-    paletteType: "cargo" as ModuleType,
     paletteSize: "S" as ModuleSize,
     hullColor: "#5a6b8c",
     hullStyle: "plated" as HullStyle,
   };
-  const readout = { status: "OK — layout valid", selected: "—" };
+  const readout = { status: "OK — layout valid" };
   const perf = {
     mass: 0, thrust: 0, speed: 0, turn: 0,
     powerGen: 0, powerUse: 0, powerBalance: 0, heat: 0,
@@ -395,26 +351,19 @@ function setup(ctx: SceneContext): SceneInstance {
   const round1 = (v: number): number => Math.round(v * 10) / 10;
 
   // ---- geometry helpers -------------------------------------------------------------
-  function cellX(x: number): number {
-    return (x - (w - 1) / 2) * CELL;
-  }
-  function cellY(y: number): number {
-    return (y - (h - 1) / 2) * CELL;
-  }
-  function cellZ(z: number): number {
-    return (z - (d - 1) / 2) * CELL;
-  }
-  function isExteriorCell(x: number, y: number, z: number): boolean {
-    return x === 0 || x === w - 1 || y === 0 || y === h - 1 || z === 0 || z === d - 1;
-  }
+  // Unbounded lattice: a cell's world position is simply its integer coord times CELL.
+  const cellX = (x: number): number => x * CELL;
+  const cellY = (y: number): number => y * CELL;
+  const cellZ = (z: number): number => z * CELL;
   // World-space center of a footprint anchored at (x,y,z) with dims (dx,dy,dz).
   function footprintCenter(x: number, y: number, z: number, dx: number, dy: number, dz: number): THREE.Vector3 {
     return new THREE.Vector3(cellX(x + (dx - 1) / 2), cellY(y + (dy - 1) / 2), cellZ(z + (dz - 1) / 2));
   }
-  function occupantAt(x: number, y: number, z: number): Module | null {
+  function occupantAt(x: number, y: number, z: number, exclude: Module | null = null): Module | null {
     // Layouts are tiny (<40 modules, footprints <=8 cells) so a linear scan over
     // modules and their footprints is cheaper than maintaining a cell->module map.
     for (const m of modules) {
+      if (m === exclude) continue;
       if (x >= m.x && x < m.x + m.dx && y >= m.y && y < m.y + m.dy && z >= m.z && z < m.z + m.dz) return m;
     }
     return null;
@@ -442,23 +391,11 @@ function setup(ctx: SceneContext): SceneInstance {
     for (let ix = x; ix < x + dx; ix++) {
       for (let iy = y; iy < y + dy; iy++) {
         for (let iz = z; iz < z + dz; iz++) {
-          const occ = occupantAt(ix, iy, iz);
-          if (occ && occ !== exclude) return false;
+          if (occupantAt(ix, iy, iz, exclude)) return false;
         }
       }
     }
     return true;
-  }
-  // At least one footprint cell lies on a grid boundary (weapon hardpoint rule).
-  function footprintExterior(x: number, y: number, z: number, dx: number, dy: number, dz: number): boolean {
-    for (let ix = x; ix < x + dx; ix++) {
-      for (let iy = y; iy < y + dy; iy++) {
-        for (let iz = z; iz < z + dz; iz++) {
-          if (isExteriorCell(ix, iy, iz)) return true;
-        }
-      }
-    }
-    return false;
   }
   // At least one footprint cell is orthogonally adjacent to another module's cell.
   function footprintHasNeighbor(x: number, y: number, z: number, dx: number, dy: number, dz: number, exclude: Module | null): boolean {
@@ -466,8 +403,38 @@ function setup(ctx: SceneContext): SceneInstance {
       for (let iy = y; iy < y + dy; iy++) {
         for (let iz = z; iz < z + dz; iz++) {
           for (const [ddx, ddy, ddz] of DIRS) {
-            const n = occupantAt(ix + ddx, iy + ddy, iz + ddz);
-            if (n && n !== exclude) return true;
+            const n = occupantAt(ix + ddx, iy + ddy, iz + ddz, exclude);
+            if (n) return true;
+          }
+        }
+      }
+    }
+    return false;
+  }
+  // Engine exhaust clearance: every REAR-face cell (the +z outermost layer of the
+  // footprint) must have a FREE cell directly behind it (+z). Replaces v1's "rearmost
+  // grid layer" rule — in unbounded space "rear" is local to the engine, not a wall.
+  function engineRearClearAt(x: number, y: number, z: number, dx: number, dy: number, dz: number, exclude: Module | null): boolean {
+    const behind = z + dz; // cell layer immediately behind the rear face
+    for (let ix = x; ix < x + dx; ix++) {
+      for (let iy = y; iy < y + dy; iy++) {
+        if (occupantAt(ix, iy, behind, exclude)) return false;
+      }
+    }
+    return true;
+  }
+  // External hardpoint: at least one footprint cell has at least one FREE orthogonal
+  // neighbor (i.e. the weapon is not fully buried). A neighbor inside the footprint
+  // itself doesn't count as free — it's internal.
+  function weaponHardpointAt(x: number, y: number, z: number, dx: number, dy: number, dz: number, exclude: Module | null): boolean {
+    for (let ix = x; ix < x + dx; ix++) {
+      for (let iy = y; iy < y + dy; iy++) {
+        for (let iz = z; iz < z + dz; iz++) {
+          for (const [ddx, ddy, ddz] of DIRS) {
+            const nx = ix + ddx, ny = iy + ddy, nz = iz + ddz;
+            const inside = nx >= x && nx < x + dx && ny >= y && ny < y + dy && nz >= z && nz < z + dz;
+            if (inside) continue;
+            if (!occupantAt(nx, ny, nz, exclude)) return true;
           }
         }
       }
@@ -475,50 +442,35 @@ function setup(ctx: SceneContext): SceneInstance {
     return false;
   }
 
-  function rebuildGrid(): void {
-    const positions: number[] = [];
-    const hs = CELL / 2;
-    for (let x = 0; x < w; x++) {
-      for (let y = 0; y < h; y++) {
-        for (let z = 0; z < d; z++) {
-          const cx = cellX(x);
-          const cy = cellY(y);
-          const cz = cellZ(z);
-          for (const [a, b] of BOX_EDGES) {
-            const ca = BOX_CORNERS[a];
-            const cb = BOX_CORNERS[b];
-            positions.push(cx + ca[0] * hs, cy + ca[1] * hs, cz + ca[2] * hs);
-            positions.push(cx + cb[0] * hs, cy + cb[1] * hs, cz + cb[2] * hs);
-          }
-        }
-      }
-    }
-    gridLines.geometry.dispose();
-    const g = new THREE.BufferGeometry();
-    g.setAttribute("position", new THREE.Float32BufferAttribute(positions, 3));
-    gridLines.geometry = g;
-  }
-
   // ---- module lifecycle -------------------------------------------------------------
-  function positionModuleMesh(mesh: THREE.Object3D, m: Module): void {
-    mesh.position.copy(footprintCenter(m.x, m.y, m.z, m.dx, m.dy, m.dz));
+  function positionMeshAt(mesh: THREE.Object3D, x: number, y: number, z: number, dx: number, dy: number, dz: number): void {
+    mesh.position.copy(footprintCenter(x, y, z, dx, dy, dz));
   }
-  function addModuleAt(type: ModuleType, size: ModuleSize, x: number, y: number, z: number): Module {
+  function positionModuleMesh(mesh: THREE.Object3D, m: Module): void {
+    positionMeshAt(mesh, m.x, m.y, m.z, m.dx, m.dy, m.dz);
+  }
+  // Builds a module + its mesh WITHOUT registering it in the layout (used by the drag
+  // preview, which floats a not-yet-committed block). addModuleAt() does the registering.
+  function createModule(type: ModuleType, size: ModuleSize, x: number, y: number, z: number): Module {
     const [dx, dy, dz] = SIZE_DIMS[size];
     // Base color WHITE so the icon texture's baked colors show true; restyle() drives the
-    // per-state tints (invalid red / heat lerp) as multiplies over the texture.
+    // per-state tints (invalid red / heat lerp / drag preview) as multiplies over it.
     const material = new THREE.MeshStandardMaterial({
       color: "#ffffff",
       map: iconTextures.get(iconKey(type, size)) ?? null,
       metalness: 0.2,
       roughness: 0.6,
     });
-    const mesh = new THREE.Mesh(moduleGeometryFor(size), material);
+    const mesh = new THREE.Mesh(moduleGeometryFor(dx, dy, dz), material);
     const m: Module = { type, size, x, y, z, dx, dy, dz, mesh, material };
     positionModuleMesh(mesh, m);
-    moduleGroup.add(mesh);
+    return m;
+  }
+  function addModuleAt(type: ModuleType, size: ModuleSize, x: number, y: number, z: number): Module {
+    const m = createModule(type, size, x, y, z);
+    moduleGroup.add(m.mesh);
     modules.push(m);
-    meshToModule.set(mesh, m);
+    meshToModule.set(m.mesh, m);
     return m;
   }
   function removeModule(m: Module): void {
@@ -538,54 +490,69 @@ function setup(ctx: SceneContext): SceneInstance {
     meshToModule.clear();
     selected = null;
   }
-  function moveModule(m: Module, x: number, y: number, z: number): void {
-    // Size (and therefore dims) never changes on a move — only the anchor.
+  function setModulePos(m: Module, x: number, y: number, z: number): void {
     m.x = x;
     m.y = y;
     m.z = z;
     positionModuleMesh(m.mesh, m);
   }
+  // Rotation yaws the footprint by swapping dx<->dz around the preserved anchor. The mesh
+  // just swaps to the matching cached geometry; icon texture is unaffected. If the rotated
+  // footprint collides or breaks a rule we DON'T block it — validation flags it red and
+  // the user can drag it somewhere valid.
+  function rotateModule(m: Module): void {
+    const ndx = m.dz;
+    m.dz = m.dx;
+    m.dx = ndx;
+    m.mesh.geometry = moduleGeometryFor(m.dx, m.dy, m.dz);
+    positionModuleMesh(m.mesh, m);
+  }
 
-  // ---- highlights -------------------------------------------------------------------
-  function clearHighlights(): void {
-    for (const mesh of highlightMeshes) highlightGroup.remove(mesh);
-    highlightMeshes.length = 0;
-    highlightMap.clear();
-  }
-  // One translucent green GHOST BOX (the module's full footprint) at each valid anchor.
-  // Tapping a ghost places/moves the module to that anchor.
-  function showAnchorHighlights(size: ModuleSize, anchors: Cell[]): void {
-    clearHighlights();
-    const [dx, dy, dz] = SIZE_DIMS[size];
-    const geom = ghostGeometryFor(size);
-    for (const a of anchors) {
-      const mesh = new THREE.Mesh(geom, highlightMaterial);
-      mesh.position.copy(footprintCenter(a.x, a.y, a.z, dx, dy, dz));
-      highlightGroup.add(mesh);
-      highlightMeshes.push(mesh);
-      highlightMap.set(mesh, a);
+  // ---- placement anchors (repair + duplicate) ---------------------------------------
+  // Bounding box of every occupied cell (null when the ship is empty).
+  function structureBounds(): { minX: number; maxX: number; minY: number; maxY: number; minZ: number; maxZ: number } | null {
+    if (modules.length === 0) return null;
+    let minX = Infinity, maxX = -Infinity, minY = Infinity, maxY = -Infinity, minZ = Infinity, maxZ = -Infinity;
+    for (const m of modules) {
+      minX = Math.min(minX, m.x); maxX = Math.max(maxX, m.x + m.dx - 1);
+      minY = Math.min(minY, m.y); maxY = Math.max(maxY, m.y + m.dy - 1);
+      minZ = Math.min(minZ, m.z); maxZ = Math.max(maxZ, m.z + m.dz - 1);
     }
+    return { minX, maxX, minY, maxY, minZ, maxZ };
   }
-  // Valid placement anchors for a (type,size) module, excluding `exclude` (the module
-  // being moved) from occupancy/adjacency: the footprint must fit fully inside the grid,
-  // all its cells must be free, at least one cell must touch another module, and the
-  // per-type positional rule (engine rear / weapon exterior) must hold at that anchor.
-  // Full re-validation still runs after the edit regardless.
-  function validAnchors(type: ModuleType, size: ModuleSize, exclude: Module | null): Cell[] {
-    const [dx, dy, dz] = SIZE_DIMS[size];
+  // Valid anchors for a (type, dims) footprint, enumerated from the free cells around the
+  // existing structure: scan the structure's bounding box grown by the footprint on each
+  // side, keep anchors whose footprint fits free, touches the structure, and satisfies the
+  // per-type positional rule. `exclude` (the module being relocated) is treated as free.
+  function validAnchorsFor(type: ModuleType, dx: number, dy: number, dz: number, exclude: Module | null): Cell[] {
+    const b = structureBounds();
     const out: Cell[] = [];
-    for (let x = 0; x + dx <= w; x++) {
-      for (let y = 0; y + dy <= h; y++) {
-        for (let z = 0; z + dz <= d; z++) {
+    if (!b) return out; // empty ship — callers handle the origin drop themselves.
+    for (let x = b.minX - dx; x <= b.maxX + 1; x++) {
+      for (let y = b.minY - dy; y <= b.maxY + 1; y++) {
+        for (let z = b.minZ - dz; z <= b.maxZ + 1; z++) {
           if (!footprintFree(x, y, z, dx, dy, dz, exclude)) continue;
-          if (type === "engine" && z + dz - 1 !== d - 1) continue;
-          if (type === "weapon" && !footprintExterior(x, y, z, dx, dy, dz)) continue;
           if (!footprintHasNeighbor(x, y, z, dx, dy, dz, exclude)) continue;
+          if (type === "engine" && !engineRearClearAt(x, y, z, dx, dy, dz, exclude)) continue;
+          if (type === "weapon" && !weaponHardpointAt(x, y, z, dx, dy, dz, exclude)) continue;
           out.push({ x, y, z });
         }
       }
     }
     return out;
+  }
+  // Nearest anchor to a reference cell (nearest-first == searching the ring outward).
+  function nearestAnchor(anchors: Cell[], rx: number, ry: number, rz: number): Cell | null {
+    let best: Cell | null = null;
+    let bestD = Infinity;
+    for (const a of anchors) {
+      const dd = Math.abs(a.x - rx) + Math.abs(a.y - ry) + Math.abs(a.z - rz);
+      if (dd < bestD) {
+        bestD = dd;
+        best = a;
+      }
+    }
+    return best;
   }
 
   // ---- connectivity + validation ----------------------------------------------------
@@ -663,17 +630,17 @@ function setup(ctx: SceneContext): SceneInstance {
 
     if (perf.powerBalance < 0) issues.push("power deficit");
 
-    // Rule 3: every engine's rearmost cell layer (anchor.z + dz - 1) must be the rear.
-    const offRear = modules.filter((m) => m.type === "engine" && m.z + m.dz - 1 !== d - 1);
-    for (const m of offRear) offending.add(m);
-    if (offRear.length > 0) issues.push(`${offRear.length > 1 ? `${offRear.length} engines` : "engine"} off rear`);
+    // Rule: every engine needs clear space directly behind its rear face (exhaust).
+    const blocked = modules.filter((m) => m.type === "engine" && !engineRearClearAt(m.x, m.y, m.z, m.dx, m.dy, m.dz, null));
+    for (const m of blocked) offending.add(m);
+    if (blocked.length > 0) issues.push(`${blocked.length > 1 ? `${blocked.length} engines` : "engine"} exhaust blocked`);
 
-    // Rule 4: every weapon must have at least one exterior footprint cell (a hardpoint).
-    const interior = modules.filter((m) => m.type === "weapon" && !footprintExterior(m.x, m.y, m.z, m.dx, m.dy, m.dz));
-    for (const m of interior) offending.add(m);
-    if (interior.length > 0) issues.push(`${interior.length > 1 ? `${interior.length} weapons` : "weapon"} interior`);
+    // Rule: every weapon must have a free neighbor (an external hardpoint, not buried).
+    const buried = modules.filter((m) => m.type === "weapon" && !weaponHardpointAt(m.x, m.y, m.z, m.dx, m.dy, m.dz, null));
+    for (const m of buried) offending.add(m);
+    if (buried.length > 0) issues.push(`${buried.length > 1 ? `${buried.length} weapons` : "weapon"} buried`);
 
-    // Rule 5: everything must form one connected component; islands are unpowered.
+    // Rule: everything must form one connected component; islands are unpowered.
     const largest = largestComponent();
     const disconnected = modules.filter((m) => !largest.has(m));
     for (const m of disconnected) offending.add(m);
@@ -684,18 +651,16 @@ function setup(ctx: SceneContext): SceneInstance {
       : `${issues.length} issue${issues.length > 1 ? "s" : ""}: ${issues.join("; ")}`;
   }
 
-  function selectionLabel(): string {
-    if (!selected) return "—";
-    const cells = selected.dx * selected.dy * selected.dz;
-    return `${selected.type} ${selected.size} (${cells} cell${cells > 1 ? "s" : ""})`;
+  function selectionLabel(m: Module): string {
+    const cells = m.dx * m.dy * m.dz;
+    return `${m.type} ${m.size} · ${cells} cell${cells > 1 ? "s" : ""}`;
   }
 
   // ---- visual styling ---------------------------------------------------------------
   function restyle(): void {
-    readout.selected = selectionLabel();
     for (const m of modules) {
-      // Emissive still uses the type color for selection/baseline self-glow (unchanged);
-      // only the diffuse base color moved to white so the icon texture reads true.
+      // Emissive uses the type color for selection/baseline self-glow; the diffuse base
+      // stays white so the icon texture reads true (tints multiply over it).
       const glow = SPECS[m.type].color;
       m.material.color.set("#ffffff");
       if (state.view === "performance") {
@@ -727,6 +692,14 @@ function setup(ctx: SceneContext): SceneInstance {
       }
       m.mesh.scale.setScalar(isSel ? 1.12 : 1);
     }
+  }
+  // While dragging, the dragged mesh IS the preview: green-ish when the placement is
+  // valid, red-ish when it collides. Overrides restyle() until the drag commits/aborts.
+  function applyDragTint(m: Module, valid: boolean): void {
+    m.material.color.set("#ffffff");
+    m.material.emissive.set(valid ? "#43f08a" : "#ff3b3b");
+    m.material.emissiveIntensity = 0.9;
+    m.mesh.scale.setScalar(1.12);
   }
 
   // ---- generated exterior hull ------------------------------------------------------
@@ -834,23 +807,32 @@ function setup(ctx: SceneContext): SceneInstance {
   // ---- view + camera ----------------------------------------------------------------
   function applyView(): void {
     const internalLike = state.view !== "exterior";
-    gridLines.visible = internalLike;
     moduleGroup.visible = internalLike;
-    highlightGroup.visible = internalLike;
     hullGroup.visible = state.view === "exterior";
     if (state.view === "exterior") buildHull();
     if (state.view === "performance") perfFolder.open();
     else perfFolder.close();
     restyle();
+    updateBars();
   }
   function frameCamera(): void {
-    controls.target.set(0, 0, 0);
-    const diag = CELL * Math.hypot(w, h, d);
+    // Frame the layout's bounding sphere: target its center, sit back by its diagonal.
+    const b = structureBounds();
+    const target = new THREE.Vector3();
+    let diag = CELL * 4;
+    if (b) {
+      const minWX = cellX(b.minX) - CELL / 2, maxWX = cellX(b.maxX) + CELL / 2;
+      const minWY = cellY(b.minY) - CELL / 2, maxWY = cellY(b.maxY) + CELL / 2;
+      const minWZ = cellZ(b.minZ) - CELL / 2, maxWZ = cellZ(b.maxZ) + CELL / 2;
+      target.set((minWX + maxWX) / 2, (minWY + maxWY) / 2, (minWZ + maxWZ) / 2);
+      diag = Math.hypot(maxWX - minWX, maxWY - minWY, maxWZ - minWZ);
+    }
+    controls.target.copy(target);
     // A portrait phone's horizontal FOV is the binding constraint here
     // (~27° at 55° vertical on a 390x844 viewport), so the camera has to sit
     // much farther back than the vertical FOV alone would suggest — at the
-    // "obvious" ~1.3x diag distance the grid overflows the screen sideways.
-    camera.position.set(diag * 1.35, diag * 1.05, diag * 1.6);
+    // "obvious" ~1.3x diag distance the layout overflows the screen sideways.
+    camera.position.set(target.x + diag * 1.35, target.y + diag * 1.05, target.z + diag * 1.6);
     controls.update();
   }
 
@@ -859,155 +841,94 @@ function setup(ctx: SceneContext): SceneInstance {
     recomputeStats();
     validate();
     restyle();
+    updateBars();
     if (state.view === "exterior") buildHull();
   }
 
   function loadPrefab(name: PrefabName): void {
-    clearHighlights();
     clearModules();
-    mode = "idle";
-    pendingType = null;
-    pendingSize = null;
     const p = PREFABS[name];
-    w = p.w;
-    h = p.h;
-    d = p.d;
-    rebuildGrid();
     // Prefabs are all size "S" — their baked-in stats are regression baselines.
     for (const def of p.modules) addModuleAt(def.type, "S", def.x, def.y, def.z);
+    // Translate the layout so its center of mass sits near the origin — unbounded space
+    // has no natural center. Round the (cell-count-weighted) mean so cells stay integral.
+    let sx = 0, sy = 0, sz = 0, tot = 0;
+    for (const m of modules) {
+      const c = m.dx * m.dy * m.dz;
+      sx += (m.x + (m.dx - 1) / 2) * c;
+      sy += (m.y + (m.dy - 1) / 2) * c;
+      sz += (m.z + (m.dz - 1) / 2) * c;
+      tot += c;
+    }
+    const ox = Math.round(sx / tot), oy = Math.round(sy / tot), oz = Math.round(sz / tot);
+    for (const m of modules) setModulePos(m, m.x - ox, m.y - oy, m.z - oz);
+
     state.hullColor = p.hullColor;
     hullMaterial.color.set(p.hullColor);
     hullColorCtrl.updateDisplay();
+    selected = null;
     onLayoutChanged();
     frameCamera();
     applyView();
   }
 
-  // ---- tap handling -----------------------------------------------------------------
-  function tapModule(m: Module): void {
-    selected = m;
-    mode = "move";
-    pendingType = null;
-    pendingSize = null;
-    showAnchorHighlights(m.size, validAnchors(m.type, m.size, m));
-    restyle();
-  }
-  function tapHighlight(cell: Cell): void {
-    if (mode === "move" && selected) {
-      moveModule(selected, cell.x, cell.y, cell.z);
-    } else if (mode === "add" && pendingType && pendingSize) {
-      selected = addModuleAt(pendingType, pendingSize, cell.x, cell.y, cell.z);
+  // ---- duplicate + rotate + remove (selection actions) ------------------------------
+  function duplicateSelected(): void {
+    if (!selected) return;
+    // Copy the selected module to the nearest valid free anchor adjacent to it (the ring
+    // search fans outward from its own anchor). Duplicate keeps the current dims.
+    const anchors = validAnchorsFor(selected.type, selected.dx, selected.dy, selected.dz, null);
+    const dest = nearestAnchor(anchors, selected.x, selected.y, selected.z);
+    if (!dest) {
+      readout.status = "No room to duplicate — free up a face first";
+      return;
     }
-    mode = "idle";
-    pendingType = null;
-    pendingSize = null;
-    clearHighlights();
+    const copy = addModuleAt(selected.type, selected.size, dest.x, dest.y, dest.z);
+    // A duplicate of a rotated module should match its orientation.
+    if (copy.dx !== selected.dx || copy.dz !== selected.dz) {
+      copy.dx = selected.dx;
+      copy.dz = selected.dz;
+      copy.mesh.geometry = moduleGeometryFor(copy.dx, copy.dy, copy.dz);
+      positionModuleMesh(copy.mesh, copy);
+    }
+    select(copy);
     onLayoutChanged();
   }
-  function tapEmpty(): void {
-    selected = null;
-    mode = "idle";
-    pendingType = null;
-    pendingSize = null;
-    clearHighlights();
-    restyle();
+  function removeSelected(): void {
+    if (!selected) return;
+    removeModule(selected);
+    select(null);
+    onLayoutChanged();
   }
-
-  const raycaster = new THREE.Raycaster();
-  const ndc = new THREE.Vector2();
-  function handleTap(clientX: number, clientY: number): void {
-    if (state.view === "exterior") return; // exterior is a read-only preview.
-    const rect = canvas.getBoundingClientRect();
-    ndc.x = ((clientX - rect.left) / rect.width) * 2 - 1;
-    ndc.y = -((clientY - rect.top) / rect.height) * 2 + 1;
-    raycaster.setFromCamera(ndc, camera);
-    // Only module + highlight meshes are interactive.
-    const hits = raycaster.intersectObjects([...highlightMeshes, ...modules.map((m) => m.mesh)], false);
-    if (hits.length === 0) {
-      tapEmpty();
-      return;
-    }
-    const obj = hits[0].object;
-    const cell = highlightMap.get(obj);
-    if (cell) {
-      tapHighlight(cell);
-      return;
-    }
-    const mod = meshToModule.get(obj);
-    if (mod) {
-      tapModule(mod);
-      return;
-    }
-    tapEmpty();
+  function rotateSelected(): void {
+    if (!selected) return;
+    rotateModule(selected);
+    onLayoutChanged();
   }
-
-  // Tap vs orbit discrimination: a "tap" is a pointerup within 300ms and <8px of the
-  // pointerdown. Anything longer or farther is an OrbitControls drag; we never
-  // preventDefault, so orbiting keeps working. A second concurrent pointer (pinch/
-  // two-finger orbit) cancels the pending tap so gestures don't misfire as edits.
-  const TAP_MS = 300;
-  const TAP_PX = 8;
-  let down: { t: number; x: number; y: number } | null = null;
-  let activePointers = 0;
-
-  function onPointerDown(e: PointerEvent): void {
-    activePointers++;
-    down = activePointers === 1 ? { t: performance.now(), x: e.clientX, y: e.clientY } : null;
-  }
-  function onPointerUp(e: PointerEvent): void {
-    activePointers = Math.max(0, activePointers - 1);
-    const d0 = down;
-    down = null;
-    if (!d0) return;
-    const dt = performance.now() - d0.t;
-    const dist = Math.hypot(e.clientX - d0.x, e.clientY - d0.y);
-    if (dt <= TAP_MS && dist < TAP_PX) handleTap(e.clientX, e.clientY);
-  }
-  function onPointerCancel(): void {
-    activePointers = Math.max(0, activePointers - 1);
-    down = null;
-  }
-  canvas.addEventListener("pointerdown", onPointerDown, { passive: true });
-  canvas.addEventListener("pointerup", onPointerUp, { passive: true });
-  canvas.addEventListener("pointercancel", onPointerCancel, { passive: true });
 
   // ---- repair -----------------------------------------------------------------------
-  // Nearest valid anchor for a module (nearest-first by cell distance from its current
-  // anchor). Excludes the module itself from occupancy/adjacency.
-  function nearestValidAnchor(m: Module): Cell | null {
-    let best: Cell | null = null;
-    let bestD = Infinity;
-    for (const a of validAnchors(m.type, m.size, m)) {
-      const dd = Math.abs(a.x - m.x) + Math.abs(a.y - m.y) + Math.abs(a.z - m.z);
-      if (dd < bestD) {
-        bestD = dd;
-        best = a;
-      }
-    }
-    return best;
-  }
   function repair(): void {
     const done: string[] = [];
 
-    // (a) Off-rear engines → nearest valid anchor (footprint fits, rear rule holds, touches).
+    // (a) Exhaust-blocked engines → nearest valid anchor (clearance behind, touches, fits).
     let enginesMoved = 0;
     for (const m of modules) {
-      if (m.type !== "engine" || m.z + m.dz - 1 === d - 1) continue;
-      const dest = nearestValidAnchor(m);
+      if (m.type !== "engine" || engineRearClearAt(m.x, m.y, m.z, m.dx, m.dy, m.dz, m)) continue;
+      const dest = nearestAnchor(validAnchorsFor(m.type, m.dx, m.dy, m.dz, m), m.x, m.y, m.z);
       if (dest) {
-        moveModule(m, dest.x, dest.y, dest.z);
+        setModulePos(m, dest.x, dest.y, dest.z);
         enginesMoved++;
       }
     }
-    if (enginesMoved > 0) done.push(`moved ${enginesMoved} engine${enginesMoved > 1 ? "s" : ""} to rear`);
+    if (enginesMoved > 0) done.push(`cleared ${enginesMoved} engine exhaust${enginesMoved > 1 ? "s" : ""}`);
 
-    // (b) Interior weapons → nearest valid anchor (exterior rule holds).
+    // (b) Buried weapons → nearest valid anchor (a free neighbor / hardpoint).
     let weaponsMoved = 0;
     for (const m of modules) {
-      if (m.type !== "weapon" || footprintExterior(m.x, m.y, m.z, m.dx, m.dy, m.dz)) continue;
-      const dest = nearestValidAnchor(m);
+      if (m.type !== "weapon" || weaponHardpointAt(m.x, m.y, m.z, m.dx, m.dy, m.dz, m)) continue;
+      const dest = nearestAnchor(validAnchorsFor(m.type, m.dx, m.dy, m.dz, m), m.x, m.y, m.z);
       if (dest) {
-        moveModule(m, dest.x, dest.y, dest.z);
+        setModulePos(m, dest.x, dest.y, dest.z);
         weaponsMoved++;
       }
     }
@@ -1019,11 +940,7 @@ function setup(ctx: SceneContext): SceneInstance {
     for (const m of orphans) removeModule(m);
     if (orphans.length > 0) done.push(`removed ${orphans.length} disconnected module${orphans.length > 1 ? "s" : ""}`);
 
-    clearHighlights();
-    selected = null;
-    mode = "idle";
-    pendingType = null;
-    pendingSize = null;
+    select(null);
     onLayoutChanged();
 
     let msg = done.length > 0 ? `Repaired: ${done.join("; ")}` : "Nothing to auto-repair";
@@ -1032,53 +949,279 @@ function setup(ctx: SceneContext): SceneInstance {
     readout.status = msg;
   }
 
-  // ---- GUI --------------------------------------------------------------------------
-  const actions = {
-    loadPrefab: () => loadPrefab(state.prefab),
-    addModule: () => {
-      // Add uses the palette's type AND size.
-      pendingType = state.paletteType;
-      pendingSize = state.paletteSize;
-      mode = "add";
-      selected = null;
-      showAnchorHighlights(pendingSize, validAnchors(pendingType, pendingSize, null));
-      restyle();
-    },
-    duplicate: () => {
-      if (!selected) return;
-      // Duplicate copies the SELECTED module's type + size, ignoring the palette.
-      pendingType = selected.type;
-      pendingSize = selected.size;
-      mode = "add";
-      showAnchorHighlights(pendingSize, validAnchors(pendingType, pendingSize, null));
-      restyle();
-    },
-    replace: () => {
-      if (!selected) return;
-      // Keep the selected module's size and anchor; only the type changes. Since size is
-      // unchanged the footprint is unchanged, so this is always safe to do in place —
-      // just swap the icon texture to the new type's.
-      selected.type = state.paletteType;
-      selected.material.map = iconTextures.get(iconKey(selected.type, selected.size)) ?? null;
-      selected.material.needsUpdate = true;
-      clearHighlights();
-      mode = "idle";
-      pendingType = null;
-      pendingSize = null;
-      onLayoutChanged();
-    },
-    remove: () => {
-      if (!selected) return;
-      removeModule(selected);
-      selected = null;
-      clearHighlights();
-      mode = "idle";
-      pendingType = null;
-      pendingSize = null;
-      onLayoutChanged();
-    },
-    repair,
+  // ---- drag-and-drop editing --------------------------------------------------------
+  // ONE drag can be under way at a time. A module drag starts on a block on the canvas
+  // (isNew=false); a palette drag starts on a palette button (isNew=true) and spawns its
+  // module the first time the pointer crosses the canvas. Both share updateDragPreview().
+  interface Drag {
+    module: Module | null; // the mesh being moved/previewed (null until a palette spawn)
+    isNew: boolean;        // spawned from the palette → discard on invalid release
+    type: ModuleType;      // spawn descriptor (isNew only)
+    size: ModuleSize;
+    pointerId: number;
+    startX: number;
+    startY: number;
+    moved: boolean;        // crossed the 8px threshold → live drag (module drags only)
+    candidate: Cell | null;
+    valid: boolean;
+  }
+  const DRAG_PX = 8;
+  let drag: Drag | null = null;
+  // A tap on empty space (small movement, no block hit) deselects; a larger move orbited.
+  let emptyTap: { pointerId: number; startX: number; startY: number } | null = null;
+
+  const raycaster = new THREE.Raycaster();
+  const ndc = new THREE.Vector2();
+  const worldNormal = new THREE.Vector3();
+  const hitPoint = new THREE.Vector3();
+  const dragTargets: THREE.Mesh[] = [];
+
+  function raycastModules(clientX: number, clientY: number, exclude: Module | null): THREE.Intersection[] {
+    const rect = canvas.getBoundingClientRect();
+    ndc.x = ((clientX - rect.left) / rect.width) * 2 - 1;
+    ndc.y = -((clientY - rect.top) / rect.height) * 2 + 1;
+    raycaster.setFromCamera(ndc, camera);
+    dragTargets.length = 0;
+    for (const m of modules) if (m !== exclude) dragTargets.push(m.mesh);
+    return raycaster.intersectObjects(dragTargets, false);
+  }
+
+  function setDragCandidate(dg: Drag, x: number, y: number, z: number): void {
+    const m = dg.module!;
+    dg.candidate = { x, y, z };
+    positionMeshAt(m.mesh, x, y, z, m.dx, m.dy, m.dz);
+    // Preview validity is footprint-collision only (connectivity is guaranteed by the
+    // face-attach; the per-type rule is deferred to post-drop validation).
+    dg.valid = footprintFree(x, y, z, m.dx, m.dy, m.dz, m);
+    applyDragTint(m, dg.valid);
+    m.mesh.visible = true;
+  }
+
+  function updateDragPreview(dg: Drag, clientX: number, clientY: number): void {
+    const rect = canvas.getBoundingClientRect();
+    const over = clientX >= rect.left && clientX <= rect.right && clientY >= rect.top && clientY <= rect.bottom;
+    // A palette module is created on the first canvas hover (its mesh is the preview).
+    if (dg.isNew && !dg.module) {
+      if (!over) return;
+      const m = createModule(dg.type, dg.size, 0, 0, 0);
+      m.mesh.visible = false;
+      moduleGroup.add(m.mesh);
+      dg.module = m;
+    }
+    const m = dg.module;
+    if (!m) return;
+    if (!over) {
+      // Off-canvas: keep the last candidate; if none yet, hide a fresh palette ghost.
+      if (dg.candidate === null && dg.isNew) m.mesh.visible = false;
+      return;
+    }
+    // Empty ship: nothing to attach to, so a (palette) module simply drops at the origin.
+    if (modules.length === 0) {
+      setDragCandidate(dg, 0, 0, 0);
+      return;
+    }
+    const hits = raycastModules(clientX, clientY, m);
+    const hit = hits[0];
+    if (!hit || !hit.face) {
+      // No block under the pointer → keep the last candidate; if none, park it.
+      if (dg.candidate === null) {
+        if (dg.isNew) m.mesh.visible = false;
+        else positionModuleMesh(m.mesh, m);
+      }
+      return;
+    }
+    const hm = meshToModule.get(hit.object)!;
+    // Attach anchor from the hit face's world normal, rounded to its dominant axis.
+    worldNormal.copy(hit.face.normal).transformDirection(hit.object.matrixWorld);
+    const ax = Math.abs(worldNormal.x), ay = Math.abs(worldNormal.y), az = Math.abs(worldNormal.z);
+    let axis = 0, sign = 1;
+    if (ax >= ay && ax >= az) { axis = 0; sign = worldNormal.x >= 0 ? 1 : -1; }
+    else if (ay >= az) { axis = 1; sign = worldNormal.y >= 0 ? 1 : -1; }
+    else { axis = 2; sign = worldNormal.z >= 0 ? 1 : -1; }
+    // Which cell of the hit block owns this face: nudge the hit point inward along the
+    // normal (the mesh is inset inside its cell), round to the lattice, clamp to hm.
+    hitPoint.copy(hit.point);
+    if (axis === 0) hitPoint.x -= sign * CELL * 0.5;
+    else if (axis === 1) hitPoint.y -= sign * CELL * 0.5;
+    else hitPoint.z -= sign * CELL * 0.5;
+    const hcx = clampInt(Math.round(hitPoint.x / CELL), hm.x, hm.x + hm.dx - 1);
+    const hcy = clampInt(Math.round(hitPoint.y / CELL), hm.y, hm.y + hm.dy - 1);
+    const hcz = clampInt(Math.round(hitPoint.z / CELL), hm.z, hm.z + hm.dz - 1);
+    // The dragged footprint sits adjacent to that cell along the normal; the other two
+    // anchor axes align to the hit cell. For a NEGATIVE-axis normal the block extends back
+    // toward -axis, so its anchor (min corner) is offset by the dragged dims on that axis.
+    let nx = hcx, ny = hcy, nz = hcz;
+    if (axis === 0) nx = sign > 0 ? hcx + 1 : hcx - m.dx;
+    else if (axis === 1) ny = sign > 0 ? hcy + 1 : hcy - m.dy;
+    else nz = sign > 0 ? hcz + 1 : hcz - m.dz;
+    setDragCandidate(dg, nx, ny, nz);
+  }
+
+  // Commit or abort the in-flight drag. `commit` is honored only if the preview is valid.
+  function finishDrag(commit: boolean): void {
+    const dg = drag;
+    drag = null;
+    if (!dg) return;
+    const ok = commit && dg.candidate !== null && dg.valid;
+    if (dg.isNew) {
+      const m = dg.module;
+      if (m && ok) {
+        setModulePos(m, dg.candidate!.x, dg.candidate!.y, dg.candidate!.z);
+        modules.push(m);
+        meshToModule.set(m.mesh, m);
+        select(m);
+        onLayoutChanged();
+      } else if (m) {
+        // Discarded palette ghost — never entered the layout, dispose its material.
+        moduleGroup.remove(m.mesh);
+        m.material.dispose();
+      }
+    } else {
+      const m = dg.module!;
+      if (dg.moved && ok) {
+        setModulePos(m, dg.candidate!.x, dg.candidate!.y, dg.candidate!.z);
+        onLayoutChanged();
+      } else {
+        // Tap (never moved) or invalid drop: snap the mesh back to where it was.
+        positionModuleMesh(m.mesh, m);
+        restyle();
+      }
+    }
+    updateBars();
+  }
+
+  // pointerdown is captured at the DOCUMENT so it runs during the capturing phase — i.e.
+  // BEFORE OrbitControls' own pointerdown listener on the canvas (which, being on the
+  // target element, would otherwise fire first regardless of any capture flag). When the
+  // press lands on a block we disable controls here so OrbitControls bails out and the
+  // press moves the block; on empty space we leave controls enabled so it orbits. Both
+  // palette-button drags and canvas move/up are also driven document-level (a palette
+  // press never reaches the canvas, and a captured drag can wander off it).
+  function onDocPointerDown(e: PointerEvent): void {
+    if (state.view === "exterior" || drag) return; // exterior is a read-only preview.
+    if (e.target !== canvas) return; // palette/GUI presses have their own handlers.
+    const hits = raycastModules(e.clientX, e.clientY, null);
+    const m = hits[0] ? meshToModule.get(hits[0].object) ?? null : null;
+    if (m) {
+      controls.enabled = false;
+      select(m);
+      drag = { module: m, isNew: false, type: m.type, size: m.size, pointerId: e.pointerId, startX: e.clientX, startY: e.clientY, moved: false, candidate: null, valid: false };
+      try { canvas.setPointerCapture(e.pointerId); } catch { /* capture is a nicety */ }
+    } else {
+      emptyTap = { pointerId: e.pointerId, startX: e.clientX, startY: e.clientY };
+    }
+  }
+  function onDocPointerMove(e: PointerEvent): void {
+    if (!drag || e.pointerId !== drag.pointerId) return;
+    if (!drag.isNew && !drag.moved) {
+      // <8px before release is a tap (selection only); >=8px promotes to a live drag.
+      if (Math.hypot(e.clientX - drag.startX, e.clientY - drag.startY) < DRAG_PX) return;
+      drag.moved = true;
+    }
+    updateDragPreview(drag, e.clientX, e.clientY);
+  }
+  function endModuleDrag(e: PointerEvent): void {
+    controls.enabled = true;
+    try { canvas.releasePointerCapture(e.pointerId); } catch { /* already released */ }
+  }
+  function onDocPointerUp(e: PointerEvent): void {
+    if (drag && e.pointerId === drag.pointerId) {
+      if (!drag.isNew) endModuleDrag(e);
+      finishDrag(true);
+      return;
+    }
+    if (emptyTap && e.pointerId === emptyTap.pointerId) {
+      const dist = Math.hypot(e.clientX - emptyTap.startX, e.clientY - emptyTap.startY);
+      emptyTap = null;
+      if (dist < DRAG_PX) select(null); // a tap on empty space deselects; a drag orbited
+    }
+  }
+  function onDocPointerCancel(e: PointerEvent): void {
+    if (drag && e.pointerId === drag.pointerId) {
+      if (!drag.isNew) endModuleDrag(e);
+      finishDrag(false);
+    }
+    if (emptyTap && e.pointerId === emptyTap.pointerId) emptyTap = null;
+  }
+
+  document.addEventListener("pointerdown", onDocPointerDown, { capture: true });
+  document.addEventListener("pointermove", onDocPointerMove);
+  document.addEventListener("pointerup", onDocPointerUp);
+  document.addEventListener("pointercancel", onDocPointerCancel);
+
+  // ---- touch UI: palette bar + selection action bar (DOM overlays) ------------------
+  function select(m: Module | null): void {
+    selected = m;
+    restyle();
+    updateBars();
+  }
+
+  // Palette: a row of 7 type icons (drag one onto the canvas to spawn it) + a size cycle.
+  const paletteBar = document.createElement("div");
+  paletteBar.className = "ship-palette";
+  const paletteButtons: { btn: HTMLButtonElement; type: ModuleType }[] = [];
+  for (const type of MODULE_TYPES) {
+    const btn = document.createElement("button");
+    btn.className = "ship-pal-btn";
+    btn.dataset.type = type;
+    btn.setAttribute("aria-label", `add ${type}`);
+    btn.addEventListener("pointerdown", (e) => onPaletteDown(e, type));
+    paletteBar.appendChild(btn);
+    paletteButtons.push({ btn, type });
+  }
+  const sizeBtn = document.createElement("button");
+  sizeBtn.className = "ship-pal-size";
+  sizeBtn.setAttribute("aria-label", "cycle module size");
+  sizeBtn.addEventListener("click", () => {
+    const i = (MODULE_SIZES.indexOf(state.paletteSize) + 1) % MODULE_SIZES.length;
+    state.paletteSize = MODULE_SIZES[i];
+    refreshPaletteIcons();
+  });
+  paletteBar.appendChild(sizeBtn);
+  document.body.appendChild(paletteBar);
+
+  function refreshPaletteIcons(): void {
+    for (const { btn, type } of paletteButtons) btn.style.backgroundImage = `url(${iconDataURL(type, state.paletteSize)})`;
+    sizeBtn.textContent = state.paletteSize;
+  }
+  function onPaletteDown(e: PointerEvent, type: ModuleType): void {
+    if (state.view === "exterior" || drag) return;
+    e.preventDefault();
+    drag = { module: null, isNew: true, type, size: state.paletteSize, pointerId: e.pointerId, startX: e.clientX, startY: e.clientY, moved: true, candidate: null, valid: false };
+  }
+
+  // Action bar: shown only while a module is selected — rotate / duplicate / remove it.
+  const actionBar = document.createElement("div");
+  actionBar.className = "ship-actions";
+  const actionLabel = document.createElement("span");
+  actionLabel.className = "ship-actions-label";
+  actionBar.appendChild(actionLabel);
+  const mkActionBtn = (label: string, act: string, onClick: () => void): void => {
+    const b = document.createElement("button");
+    b.className = "ship-act-btn";
+    b.dataset.act = act;
+    b.textContent = label;
+    b.addEventListener("click", onClick);
+    actionBar.appendChild(b);
   };
+  mkActionBtn("⟳ Rotate", "rotate", rotateSelected);
+  mkActionBtn("⧉ Duplicate", "duplicate", duplicateSelected);
+  mkActionBtn("✕ Remove", "remove", removeSelected);
+  document.body.appendChild(actionBar);
+
+  // Both bars hide in exterior (read-only) view; the action bar also hides with no selection.
+  function updateBars(): void {
+    const editing = state.view !== "exterior";
+    paletteBar.classList.toggle("ship-hidden", !editing);
+    const showActions = editing && selected !== null;
+    actionBar.classList.toggle("ship-hidden", !showActions);
+    if (selected) actionLabel.textContent = selectionLabel(selected);
+  }
+
+  // ---- GUI --------------------------------------------------------------------------
+  // Deliberately small (the menu fix): the palette + action bars own the per-block editing
+  // that v1's Edit folder did. What's left here is ship-wide: view, prefabs, hull, repair.
+  const actions = { loadPrefab: () => loadPrefab(state.prefab), repair };
 
   gui.add(state, "view", ["internal", "exterior", "performance"]).name("View").onChange(applyView);
   gui.add(state, "prefab", ["fighter", "trader"]).name("Prefab");
@@ -1092,18 +1235,6 @@ function setup(ctx: SceneContext): SceneInstance {
     });
   gui.add(actions, "repair").name("Repair layout");
   gui.add(readout, "status").name("Status").listen().disable();
-
-  const editFolder = gui.addFolder("Edit");
-  editFolder.add(state, "paletteType", MODULE_TYPES).name("Module type");
-  editFolder.add(state, "paletteSize", MODULE_SIZES).name("Module size");
-  editFolder.add(readout, "selected").name("Selected").listen().disable();
-  editFolder.add(actions, "addModule").name("Add module (tap a green ghost)");
-  editFolder.add(actions, "duplicate").name("Duplicate selected");
-  editFolder.add(actions, "replace").name("Replace selected with palette type");
-  editFolder.add(actions, "remove").name("Remove selected");
-
-  // Rotation is intentionally omitted: orientations are fixed (see ModuleSize), so v1's
-  // single anchor tap fully determines a placement. Rotation returns when it earns it.
 
   const perfFolder = gui.addFolder("Performance");
   perfFolder.add(perf, "mass").name("Mass").listen().disable();
@@ -1121,30 +1252,32 @@ function setup(ctx: SceneContext): SceneInstance {
   perfFolder.add(perf, "burn").name("Fuel burn").listen().disable();
   perfFolder.add(perf, "range").name("Range").listen().disable();
 
-  // Initial layout: the fighter, framed and validated.
+  // Initial layout: the fighter, framed and validated. (refreshPaletteIcons after the
+  // bars + GUI exist so button tiles are stamped once.)
+  refreshPaletteIcons();
   loadPrefab("fighter");
 
   return {
-    update(_dt, elapsed) {
-      // Keep it calm: only breathe the green placement highlights. No per-frame
-      // allocation (opacity is a shared scalar on the one highlight material).
-      highlightMaterial.opacity = 0.25 + 0.15 * Math.sin(elapsed * 4);
-    },
     dispose() {
-      canvas.removeEventListener("pointerdown", onPointerDown);
-      canvas.removeEventListener("pointerup", onPointerUp);
-      canvas.removeEventListener("pointercancel", onPointerCancel);
+      document.removeEventListener("pointerdown", onDocPointerDown, { capture: true });
+      document.removeEventListener("pointermove", onDocPointerMove);
+      document.removeEventListener("pointerup", onDocPointerUp);
+      document.removeEventListener("pointercancel", onDocPointerCancel);
+      paletteBar.remove();
+      actionBar.remove();
 
-      clearHighlights();
+      // A palette ghost may be mid-flight (never registered in `modules`) — dispose it.
+      if (drag && drag.isNew && drag.module) {
+        moduleGroup.remove(drag.module.mesh);
+        drag.module.material.dispose();
+      }
+      drag = null;
+
       clearModules(); // disposes each per-module material
       disposeHullMeshes();
-      gridLines.geometry.dispose();
 
       for (const g of moduleGeomCache.values()) g.dispose();
-      for (const g of ghostGeomCache.values()) g.dispose();
       for (const t of iconTextures.values()) t.dispose();
-      highlightMaterial.dispose();
-      gridMaterial.dispose();
       hullMaterial.dispose();
       nozzleMaterial.dispose();
 
@@ -1165,6 +1298,6 @@ function setup(ctx: SceneContext): SceneInstance {
 export const shipDesignerScene: TestScene = {
   id: "ship-designer",
   name: "Ship Designer (Modular)",
-  description: "Assemble reactors, engines, weapons and cargo on a 3D grid — hull stretches to fit, stats update live.",
+  description: "Assemble reactors, engines, weapons and cargo by attaching blocks face-to-face — hull stretches to fit, stats update live.",
   setup,
 };
