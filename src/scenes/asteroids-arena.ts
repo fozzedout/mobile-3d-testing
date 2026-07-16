@@ -5,6 +5,7 @@ import { FlightRig } from "../core/flight-rig.ts";
 import { HitFlash } from "../core/hit-flash.ts";
 import { FireZone } from "../core/fire-zone.ts";
 import { buildStarfield } from "../core/starfield.ts";
+import { segmentHitsSphere } from "../core/swept-hit.ts";
 
 const SHIP_RADIUS = 3;
 const BASE_ROCK_RADIUS = 4;
@@ -30,6 +31,9 @@ interface Asteroid {
   spin: THREE.Vector3;
   size: AsteroidSize;
   radius: number;
+  // Cached each frame by the scanner feed so sorting nearest-first only pays
+  // for one distanceToSquared per asteroid instead of one per comparison.
+  scannerDistSq: number;
 }
 
 interface Laser {
@@ -37,6 +41,17 @@ interface Laser {
   velocity: THREE.Vector3;
   age: number;
 }
+
+interface ScannerTarget {
+  label: AsteroidSize;
+  color: string;
+  position: THREE.Vector3;
+}
+
+// Advancing a laser mutates its position in place, so the pre-advance point
+// needed for a swept hit test has to be captured before that happens. One
+// shared scratch avoids allocating a Vector3 per laser per frame.
+const laserSweepFrom = new THREE.Vector3();
 
 function randomVelocity(speedMin: number, speedMax: number): THREE.Vector3 {
   const speed = THREE.MathUtils.lerp(speedMin, speedMax, Math.random());
@@ -87,6 +102,20 @@ function setup(ctx: SceneContext): SceneInstance {
   const asteroids: Asteroid[] = [];
   const lasers: Laser[] = [];
 
+  // Scanner-feed scratch: `scannerCandidates` is repopulated in place each
+  // frame (no clone of `asteroids`) and sorted by the cached scannerDistSq
+  // field, so the comparator does zero sqrt calls. `scannerPool` holds
+  // SCANNER_MAX_TARGETS pre-allocated target objects that get their fields
+  // overwritten in place; `scannerTargets` is a thin, reusable view over the
+  // pool (references only, no per-frame object/array allocation) truncated
+  // to however many targets are in range this frame.
+  const scannerCandidates: Asteroid[] = [];
+  const scannerPool: ScannerTarget[] = [];
+  for (let i = 0; i < SCANNER_MAX_TARGETS; i++) {
+    scannerPool.push({ label: "large", color: "", position: new THREE.Vector3() });
+  }
+  const scannerTargets: ScannerTarget[] = [];
+
   let state: "countdown" | "playing" | "gameover" = "countdown";
   let countdownRemaining = 3;
   let invulnerable = 0;
@@ -118,7 +147,7 @@ function setup(ctx: SceneContext): SceneInstance {
     // an already-boosted velocity and send small rocks rocketing away).
     const velocity = inheritedVelocity ? inheritedVelocity.clone().multiplyScalar(0.5).add(randomVelocity(3, 7)) : randomVelocity(3, 8);
     const spin = new THREE.Vector3(Math.random() - 0.5, Math.random() - 0.5, Math.random() - 0.5).multiplyScalar(1.4);
-    asteroids.push({ mesh, velocity, spin, size, radius: def.radius });
+    asteroids.push({ mesh, velocity, spin, size, radius: def.radius, scannerDistSq: 0 });
   }
 
   function startNextWave(): void {
@@ -229,6 +258,11 @@ function setup(ctx: SceneContext): SceneInstance {
       if (state === "playing") {
         for (let i = lasers.length - 1; i >= 0; i--) {
           const laser = lasers[i];
+          // Capture the pre-advance point so the hit test can sweep the
+          // whole segment traveled this frame, not just sample the endpoint
+          // (see swept-hit.ts: at 220 u/s a laser can cover more distance
+          // than a small asteroid's radius in a single slow mobile frame).
+          laserSweepFrom.copy(laser.mesh.position);
           laser.mesh.position.addScaledVector(laser.velocity, delta);
           laser.age += delta;
           if (laser.age > LASER_LIFETIME) {
@@ -238,7 +272,7 @@ function setup(ctx: SceneContext): SceneInstance {
           }
           for (let j = asteroids.length - 1; j >= 0; j--) {
             const asteroid = asteroids[j];
-            if (laser.mesh.position.distanceTo(asteroid.mesh.position) < asteroid.radius) {
+            if (segmentHitsSphere(laserSweepFrom, laser.mesh.position, asteroid.mesh.position, asteroid.radius)) {
               scene.remove(laser.mesh);
               lasers.splice(i, 1);
               splitAsteroid(asteroid);
@@ -265,14 +299,24 @@ function setup(ctx: SceneContext): SceneInstance {
       camera.quaternion.copy(rig.quaternion);
       shipLight.position.copy(rig.position);
 
-      const nearest = [...asteroids]
-        .sort((a, b) => a.mesh.position.distanceTo(rig.position) - b.mesh.position.distanceTo(rig.position))
-        .slice(0, SCANNER_MAX_TARGETS);
-      scanner.update(
-        rig.position,
-        rig.quaternion,
-        nearest.map((a) => ({ label: a.size, color: SIZE_DEFS[a.size].color, position: a.mesh.position })),
-      );
+      scannerCandidates.length = 0;
+      for (const asteroid of asteroids) {
+        asteroid.scannerDistSq = asteroid.mesh.position.distanceToSquared(rig.position);
+        scannerCandidates.push(asteroid);
+      }
+      scannerCandidates.sort((a, b) => a.scannerDistSq - b.scannerDistSq);
+
+      const scannerCount = Math.min(scannerCandidates.length, SCANNER_MAX_TARGETS);
+      scannerTargets.length = 0;
+      for (let i = 0; i < scannerCount; i++) {
+        const asteroid = scannerCandidates[i];
+        const slot = scannerPool[i];
+        slot.label = asteroid.size;
+        slot.color = SIZE_DEFS[asteroid.size].color;
+        slot.position = asteroid.mesh.position;
+        scannerTargets.push(slot);
+      }
+      scanner.update(rig.position, rig.quaternion, scannerTargets);
     },
     dispose() {
       rig.dispose();
