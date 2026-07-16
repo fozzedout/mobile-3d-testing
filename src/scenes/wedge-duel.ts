@@ -5,6 +5,7 @@ import { FlightRig } from "../core/flight-rig.ts";
 import { HitFlash } from "../core/hit-flash.ts";
 import { FireZone } from "../core/fire-zone.ts";
 import { buildStarfield } from "../core/starfield.ts";
+import { segmentHitsSphere } from "../core/swept-hit.ts";
 
 const SHIP_RADIUS = 3;
 const LASER_SPEED = 220;
@@ -25,6 +26,10 @@ const FIGHTER_MAX_SPEED_CAP = 50;
 // the player's look rate — reversing course costs an actual turn, not an
 // instant retarget of its velocity vector.
 const FIGHTER_TURN_RATE_DEG = 100;
+// Turn rate scales with kills just like maxSpeed does — otherwise a "harder"
+// (faster) fighter actually tracks worse, flying a wider turning circle.
+const FIGHTER_TURN_PER_KILL = 4;
+const FIGHTER_TURN_RATE_CAP = 140;
 const FIGHTER_MAX_BANK_DEG = 42; // purely cosmetic roll into turns, doesn't affect physics
 const FIGHTER_MIN_RANGE = 45;
 const FIGHTER_MAX_RANGE = 100;
@@ -34,7 +39,10 @@ const FIGHTER_FIRE_RANGE = 150;
 const FIGHTER_FIRE_ALIGNMENT_MIN = 0.85;
 const FIGHTER_EVADE_LOOKAHEAD = 0.7;
 const FIGHTER_EVADE_RADIUS = 20;
-const FIGHTER_EVADE_DURATION = 0.7;
+// While evading, the turn rate is boosted so the dodge reads as a distinct
+// sharp jink rather than the same lazy arc it flies while orbiting.
+const FIGHTER_EVADE_TURN_MULT = 1.6;
+const FIGHTER_EVADE_MAX_DURATION = 1.8;
 const FIGHTER_FIRE_COOLDOWN_MIN_BASE = 1.0;
 const FIGHTER_FIRE_COOLDOWN_MAX_BASE = 1.9;
 const FIGHTER_FIRE_COOLDOWN_SHRINK_PER_KILL = 0.05;
@@ -53,11 +61,13 @@ interface Fighter {
   quaternion: THREE.Quaternion;
   velocity: THREE.Vector3;
   maxSpeed: number;
+  turnRate: number; // deg/s, scales with kills (set at spawn)
   hp: number;
   fireCooldown: number;
   strafeSign: number;
   strafeTimer: number;
-  evadeDir: THREE.Vector3 | null;
+  orbitAzimuth: number; // roll of the orbit plane around the line to the player
+  evadeDir: THREE.Vector3;
   evadeTimer: number;
 }
 
@@ -66,6 +76,35 @@ interface Laser {
   velocity: THREE.Vector3;
   age: number;
 }
+
+// Read-only unit references. NEVER mutate these — copy into scratch first.
+const FORWARD = new THREE.Vector3(0, 0, -1);
+const WORLD_Y = new THREE.Vector3(0, 1, 0);
+const WORLD_X = new THREE.Vector3(1, 0, 0);
+const ROLL_AXIS = new THREE.Vector3(0, 0, 1);
+
+// Per-frame scratch, hoisted to module scope to keep the AI/laser hot paths
+// allocation-free (this repo is a mobile GC testbed). Single-threaded, so
+// reuse is safe as long as no two live values alias the same object within a
+// frame — each is traced to stay disjoint where it matters.
+const _toPlayer = new THREE.Vector3();
+const _toPlayerDir = new THREE.Vector3();
+const _rel = new THREE.Vector3();
+const _closestPoint = new THREE.Vector3();
+const _lateral = new THREE.Vector3();
+const _desiredDir = new THREE.Vector3();
+const _forward = new THREE.Vector3();
+const _prevForward = new THREE.Vector3();
+const _right = new THREE.Vector3();
+const _axis = new THREE.Vector3();
+const _targetVelocity = new THREE.Vector3();
+const _prevQuat = new THREE.Quaternion();
+const _targetQuat = new THREE.Quaternion();
+const _appliedRotation = new THREE.Quaternion();
+const _bankQuat = new THREE.Quaternion();
+const _laserPrev = new THREE.Vector3();
+const _ramDelta = new THREE.Vector3();
+const _pushDir = new THREE.Vector3();
 
 function randomDirection(): THREE.Vector3 {
   const theta = Math.random() * Math.PI * 2;
@@ -207,17 +246,22 @@ function setup(ctx: SceneContext): SceneInstance {
       quaternion,
       velocity: new THREE.Vector3(),
       maxSpeed: Math.min(FIGHTER_MAX_SPEED_CAP, FIGHTER_BASE_MAX_SPEED + kills * FIGHTER_SPEED_PER_KILL),
+      turnRate: Math.min(FIGHTER_TURN_RATE_CAP, FIGHTER_TURN_RATE_DEG + kills * FIGHTER_TURN_PER_KILL),
       hp: FIGHTER_HP,
       fireCooldown: THREE.MathUtils.lerp(0.4, 1.0, Math.random()),
       strafeSign: Math.random() < 0.5 ? 1 : -1,
       strafeTimer: 0,
-      evadeDir: null,
+      orbitAzimuth: Math.random() * Math.PI * 2,
+      evadeDir: new THREE.Vector3(),
       evadeTimer: 0,
     };
   }
 
-  function fireEnemyLaser(from: Fighter, aimDir: THREE.Vector3): void {
-    const aim = aimDir.clone();
+  function fireEnemyLaser(from: Fighter): void {
+    // Nose guns fire straight down the current heading (plus jitter), not at
+    // the player's true position — the alignment gate at the call site is what
+    // makes a shot land, so bolts always leave the nose, never sideways.
+    const aim = new THREE.Vector3(0, 0, -1).applyQuaternion(from.quaternion);
     const jitterAxis = new THREE.Vector3(Math.random() - 0.5, Math.random() - 0.5, Math.random() - 0.5);
     if (jitterAxis.lengthSq() < 1e-6) jitterAxis.set(0, 1, 0);
     jitterAxis.normalize();
@@ -231,43 +275,58 @@ function setup(ctx: SceneContext): SceneInstance {
   }
 
   function updateFighterAI(active: Fighter, delta: number): void {
-    const toPlayer = rig.position.clone().sub(active.position);
-    const dist = toPlayer.length();
-    const toPlayerDir = dist > 0.0001 ? toPlayer.clone().normalize() : new THREE.Vector3(0, 0, -1);
+    _toPlayer.subVectors(rig.position, active.position);
+    const dist = _toPlayer.length();
+    if (dist > 0.0001) _toPlayerDir.copy(_toPlayer).normalize();
+    else _toPlayerDir.copy(FORWARD);
+
+    // Effective turn rate for this frame: the per-fighter (kill-scaled) rate,
+    // boosted while jinking so an evade is a visibly sharper maneuver.
+    const evadeBoost = active.evadeTimer > 0 ? FIGHTER_EVADE_TURN_MULT : 1;
+    const turnRateDeg = active.turnRate * evadeBoost;
 
     if (active.evadeTimer <= 0) {
       for (const laser of playerLasers) {
         const speed2 = laser.velocity.lengthSq();
         if (speed2 < 1e-6) continue;
-        const rel = active.position.clone().sub(laser.mesh.position);
-        const t = THREE.MathUtils.clamp(rel.dot(laser.velocity) / speed2, 0, FIGHTER_EVADE_LOOKAHEAD);
-        const closestPoint = laser.mesh.position.clone().addScaledVector(laser.velocity, t);
-        if (closestPoint.distanceTo(active.position) < FIGHTER_EVADE_RADIUS) {
-          const lateral = new THREE.Vector3().crossVectors(laser.velocity, new THREE.Vector3(0, 1, 0));
-          if (lateral.lengthSq() < 1e-6) lateral.set(1, 0, 0);
-          lateral.normalize();
-          const side = active.position.clone().sub(closestPoint).dot(lateral) < 0 ? -1 : 1;
-          active.evadeDir = lateral.multiplyScalar(side);
-          active.evadeTimer = FIGHTER_EVADE_DURATION;
+        _rel.subVectors(active.position, laser.mesh.position);
+        const t = THREE.MathUtils.clamp(_rel.dot(laser.velocity) / speed2, 0, FIGHTER_EVADE_LOOKAHEAD);
+        _closestPoint.copy(laser.mesh.position).addScaledVector(laser.velocity, t);
+        if (_closestPoint.distanceTo(active.position) < FIGHTER_EVADE_RADIUS) {
+          _lateral.crossVectors(laser.velocity, WORLD_Y);
+          if (_lateral.lengthSq() < 1e-6) _lateral.crossVectors(laser.velocity, WORLD_X);
+          _lateral.normalize();
+          const side = _rel.subVectors(active.position, _closestPoint).dot(_lateral) < 0 ? -1 : 1;
+          active.evadeDir.copy(_lateral).multiplyScalar(side);
+          // Adaptive duration: turning from the current heading to the dodge
+          // vector takes angle / rate seconds; a fixed 0.7s often expired
+          // before the nose ever swung onto the dodge. Size the window to the
+          // turn actually required (plus margin), capped so it can't loiter.
+          _prevForward.copy(FORWARD).applyQuaternion(active.quaternion);
+          const turnNeeded = _prevForward.angleTo(active.evadeDir);
+          const boostedRateRad = THREE.MathUtils.degToRad(active.turnRate * FIGHTER_EVADE_TURN_MULT);
+          active.evadeTimer = Math.min(FIGHTER_EVADE_MAX_DURATION, turnNeeded / boostedRateRad + 0.35);
           break;
         }
       }
     }
 
-    let desiredDir: THREE.Vector3;
     if (active.evadeTimer > 0) {
       active.evadeTimer -= delta;
-      desiredDir = active.evadeDir ?? toPlayerDir;
+      _desiredDir.copy(active.evadeDir);
     } else {
       active.strafeTimer -= delta;
       if (active.strafeTimer <= 0) {
         active.strafeSign = Math.random() < 0.5 ? 1 : -1;
         active.strafeTimer = THREE.MathUtils.lerp(1.2, 2.6, Math.random());
+        // Re-roll the orbit plane so successive orbits aren't all coplanar —
+        // this azimuth rolls the lead axis around the line to the player.
+        active.orbitAzimuth = Math.random() * Math.PI * 2;
       }
       if (dist < FIGHTER_MIN_RANGE) {
-        desiredDir = toPlayerDir.clone().multiplyScalar(-1); // too close: back straight off
+        _desiredDir.copy(_toPlayerDir).multiplyScalar(-1); // too close: back straight off
       } else if (dist > FIGHTER_MAX_RANGE) {
-        desiredDir = toPlayerDir.clone(); // too far: close straight in
+        _desiredDir.copy(_toPlayerDir); // too far: close straight in
       } else {
         // Comfortable range: orbit at a fixed lead angle off pure pursuit
         // rather than a pure tangential strafe (which a vector-sum blend
@@ -276,28 +335,40 @@ function setup(ctx: SceneContext): SceneInstance {
         // bounded angle guarantees the heading always stays within the
         // alignment gate (~32°) while still circling, since the orbit
         // itself keeps changing which way "toward the player" points.
+        //
+        // The lead axis is built from the engagement geometry (a local "up"
+        // perpendicular to toPlayerDir), NOT world Y: rotating around world Y
+        // barely moves toPlayerDir once the fight goes vertical, collapsing
+        // the orbit into pure pursuit. The azimuth roll makes it 3D.
+        _right.crossVectors(_toPlayerDir, WORLD_Y);
+        if (_right.lengthSq() < 1e-6) _right.crossVectors(_toPlayerDir, WORLD_X);
+        _right.normalize();
+        _axis.crossVectors(_right, _toPlayerDir).normalize();
+        _axis.applyAxisAngle(_toPlayerDir, active.orbitAzimuth);
         const leadAngle = THREE.MathUtils.degToRad(22) * active.strafeSign;
-        desiredDir = toPlayerDir.clone().applyAxisAngle(new THREE.Vector3(0, 1, 0), leadAngle);
+        _desiredDir.copy(_toPlayerDir).applyAxisAngle(_axis, leadAngle);
       }
     }
 
     // Turn toward the desired heading at a bounded rate — this (not an
     // instant velocity flip) is what makes it read as a real craft.
-    const prevQuaternion = active.quaternion.clone();
-    const prevForward = new THREE.Vector3(0, 0, -1).applyQuaternion(active.quaternion);
-    const targetQuat = new THREE.Quaternion().setFromUnitVectors(new THREE.Vector3(0, 0, -1), desiredDir);
-    const maxStep = THREE.MathUtils.degToRad(FIGHTER_TURN_RATE_DEG) * delta;
-    active.quaternion.rotateTowards(targetQuat, maxStep);
-    const forward = new THREE.Vector3(0, 0, -1).applyQuaternion(active.quaternion);
-    const turnedAngle = prevForward.angleTo(forward);
+    _prevQuat.copy(active.quaternion);
+    _prevForward.copy(FORWARD).applyQuaternion(active.quaternion);
+    _targetQuat.setFromUnitVectors(FORWARD, _desiredDir);
+    const maxStep = THREE.MathUtils.degToRad(turnRateDeg) * delta;
+    active.quaternion.rotateTowards(_targetQuat, maxStep);
+    _forward.copy(FORWARD).applyQuaternion(active.quaternion);
+    const turnedAngle = _prevForward.angleTo(_forward);
 
     // Thrust is always along the CURRENT nose direction, never the desired
-    // one — reversing course means actually turning around first. Eases off
-    // in hard turns, like a real craft scrubbing speed to corner.
-    const alignment = THREE.MathUtils.clamp(forward.dot(desiredDir), 0, 1);
-    const speedScale = THREE.MathUtils.lerp(0.5, 1, alignment);
-    const targetVelocity = forward.clone().multiplyScalar(active.maxSpeed * speedScale);
-    active.velocity.lerp(targetVelocity, 1 - Math.pow(0.001, delta));
+    // one — reversing course means actually turning around first. A craft
+    // that can't strafe has to be able to BRAKE when it's pointed the wrong
+    // way (otherwise it barrels through the player while trying to back off
+    // inside min range); the taxi floor keeps it from ever fully stalling.
+    const dot = _forward.dot(_desiredDir);
+    const speedScale = dot >= 0 ? THREE.MathUtils.lerp(0.4, 1, dot) : THREE.MathUtils.lerp(0.4, 0.06, -dot);
+    _targetVelocity.copy(_forward).multiplyScalar(active.maxSpeed * speedScale);
+    active.velocity.lerp(_targetVelocity, 1 - Math.pow(0.001, delta));
     active.position.addScaledVector(active.velocity, delta);
     active.group.position.copy(active.position);
 
@@ -309,16 +380,16 @@ function setup(ctx: SceneContext): SceneInstance {
     // alignment a fresh cross product each frame flips sign on tiny noise
     // even though no real turn was happening.
     const turnRateNow = delta > 0 ? turnedAngle / delta : 0;
-    const appliedRotation = prevQuaternion.clone().invert().multiply(active.quaternion);
-    const bankSign = Math.sign(appliedRotation.y) || 0;
-    const bankFraction = THREE.MathUtils.clamp(turnRateNow / THREE.MathUtils.degToRad(FIGHTER_TURN_RATE_DEG), 0, 1);
+    _appliedRotation.copy(_prevQuat).invert().multiply(active.quaternion);
+    const bankSign = Math.sign(_appliedRotation.y) || 0;
+    const bankFraction = THREE.MathUtils.clamp(turnRateNow / THREE.MathUtils.degToRad(active.turnRate), 0, 1);
     const bankAngle = bankFraction * THREE.MathUtils.degToRad(FIGHTER_MAX_BANK_DEG) * bankSign;
-    const bankQuat = new THREE.Quaternion().setFromAxisAngle(new THREE.Vector3(0, 0, 1), bankAngle);
-    active.group.quaternion.copy(active.quaternion).multiply(bankQuat);
+    _bankQuat.setFromAxisAngle(ROLL_AXIS, bankAngle);
+    active.group.quaternion.copy(active.quaternion).multiply(_bankQuat);
 
     if (active.fireCooldown > 0) active.fireCooldown -= delta;
-    if (active.fireCooldown <= 0 && dist <= FIGHTER_FIRE_RANGE && active.evadeTimer <= 0 && forward.dot(toPlayerDir) >= FIGHTER_FIRE_ALIGNMENT_MIN) {
-      fireEnemyLaser(active, toPlayerDir);
+    if (active.fireCooldown <= 0 && dist <= FIGHTER_FIRE_RANGE && active.evadeTimer <= 0 && _forward.dot(_toPlayerDir) >= FIGHTER_FIRE_ALIGNMENT_MIN) {
+      fireEnemyLaser(active);
       const minCd = Math.max(FIGHTER_FIRE_COOLDOWN_FLOOR, FIGHTER_FIRE_COOLDOWN_MIN_BASE - kills * FIGHTER_FIRE_COOLDOWN_SHRINK_PER_KILL);
       const maxCd = Math.max(minCd + 0.2, FIGHTER_FIRE_COOLDOWN_MAX_BASE - kills * FIGHTER_FIRE_COOLDOWN_SHRINK_PER_KILL);
       active.fireCooldown = THREE.MathUtils.lerp(minCd, maxCd, Math.random());
@@ -351,13 +422,14 @@ function setup(ctx: SceneContext): SceneInstance {
     }
   }
 
-  function loseLife(fromLaser: Laser): void {
+  // Takes a push direction (must be normalized) rather than the laser, so
+  // ship-ship rams can reuse the exact same knockback with fighter→player.
+  function loseLife(pushDir: THREE.Vector3): void {
     if (invulnerable > 0) return;
     lives -= 1;
     readout.lives = lives;
     invulnerable = INVULN_SECONDS;
     hitFlash.trigger();
-    const pushDir = fromLaser.velocity.clone().normalize();
     rig.position.addScaledVector(pushDir, 4);
     const into = rig.velocity.dot(pushDir);
     if (into < 0) rig.velocity.addScaledVector(pushDir, -into);
@@ -429,6 +501,7 @@ function setup(ctx: SceneContext): SceneInstance {
       if (state === "playing") {
         for (let i = playerLasers.length - 1; i >= 0; i--) {
           const laser = playerLasers[i];
+          _laserPrev.copy(laser.mesh.position);
           laser.mesh.position.addScaledVector(laser.velocity, delta);
           laser.age += delta;
           if (laser.age > LASER_LIFETIME) {
@@ -436,7 +509,9 @@ function setup(ctx: SceneContext): SceneInstance {
             playerLasers.splice(i, 1);
             continue;
           }
-          if (fighter && laser.mesh.position.distanceTo(fighter.position) < FIGHTER_RADIUS) {
+          // Swept test over the segment travelled this frame — a point sample
+          // at the new position tunnels through the target on slow frames.
+          if (fighter && segmentHitsSphere(_laserPrev, laser.mesh.position, fighter.position, FIGHTER_RADIUS)) {
             scene.remove(laser.mesh);
             playerLasers.splice(i, 1);
             damageFighter(fighter);
@@ -445,6 +520,7 @@ function setup(ctx: SceneContext): SceneInstance {
 
         for (let i = enemyLasers.length - 1; i >= 0; i--) {
           const laser = enemyLasers[i];
+          _laserPrev.copy(laser.mesh.position);
           laser.mesh.position.addScaledVector(laser.velocity, delta);
           laser.age += delta;
           if (laser.age > FIGHTER_LASER_LIFETIME) {
@@ -452,10 +528,10 @@ function setup(ctx: SceneContext): SceneInstance {
             enemyLasers.splice(i, 1);
             continue;
           }
-          if (invulnerable <= 0 && laser.mesh.position.distanceTo(rig.position) < SHIP_RADIUS + 1.2) {
+          if (invulnerable <= 0 && segmentHitsSphere(_laserPrev, laser.mesh.position, rig.position, SHIP_RADIUS + 1.2)) {
             scene.remove(laser.mesh);
             enemyLasers.splice(i, 1);
-            loseLife(laser);
+            loseLife(_pushDir.copy(laser.velocity).normalize());
           }
         }
 
@@ -464,6 +540,20 @@ function setup(ctx: SceneContext): SceneInstance {
         } else {
           respawnTimer -= delta;
           if (respawnTimer <= 0) spawnFighter();
+        }
+
+        // Ramming costs both sides: the player pays a life (same knockback as
+        // a hit, pushed away from the fighter) and the fighter takes damage.
+        // The player's invuln window gates re-triggering so a graze isn't
+        // instantly fatal.
+        if (fighter && invulnerable <= 0) {
+          _ramDelta.subVectors(rig.position, fighter.position);
+          const contact = FIGHTER_RADIUS + SHIP_RADIUS;
+          if (_ramDelta.lengthSq() < contact * contact) {
+            _pushDir.copy(_ramDelta).normalize();
+            loseLife(_pushDir);
+            damageFighter(fighter);
+          }
         }
       }
 
