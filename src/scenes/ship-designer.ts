@@ -7,6 +7,12 @@ import type { SceneContext, SceneInstance, TestScene } from "./types.ts";
 const CELL = 4;
 
 type ModuleType = "reactor" | "engine" | "fuel" | "weapon" | "shield" | "cargo" | "crew";
+// Set-piece module sizes. Orientations are FIXED — the long axis always runs along z
+// (the ship's nose-to-tail axis) and the wide axis along x — so there is no rotation UI.
+// Fixed orientations keep v1's tap-only editing flow simple (a single anchor tap fully
+// determines placement); rotation returns when it earns its place. Footprints in cells:
+// S = 1 cell, M = 2 (1x1x2), L = 4 (2x1x2), XL = 8 (2x2x2).
+type ModuleSize = "S" | "M" | "L" | "XL";
 type ViewMode = "internal" | "exterior" | "performance";
 type PrefabName = "fighter" | "trader";
 type HullStyle = "plated" | "box";
@@ -15,6 +21,21 @@ type HullStyle = "plated" | "box";
 type EditMode = "idle" | "move" | "add";
 
 const MODULE_TYPES: ModuleType[] = ["reactor", "engine", "fuel", "weapon", "shield", "cargo", "crew"];
+const MODULE_SIZES: ModuleSize[] = ["S", "M", "L", "XL"];
+
+// Footprint dims (dx, dy, dz) in cells for each size. dx = width (x), dy = height (y),
+// dz = length (z). Long axis along z, wide axis along x, per the fixed-orientation rule.
+const SIZE_DIMS: Record<ModuleSize, [number, number, number]> = {
+  S: [1, 1, 1],
+  M: [1, 1, 2],
+  L: [2, 1, 2],
+  XL: [2, 2, 2],
+};
+// Bigger modules are more efficient per unit of OUTPUT: output stats scale by
+// (cells × efficiency) while mass and all consumption stats scale by cells alone, so a
+// large block gives more thrust/power/cargo per mass but draws proportionally more total
+// power and heat and demands a contiguous block of free space. See recomputeStats().
+const SIZE_EFFICIENCY: Record<ModuleSize, number> = { S: 1, M: 1.05, L: 1.1, XL: 1.15 };
 
 interface ModuleSpec {
   mass: number;
@@ -32,6 +53,7 @@ interface ModuleSpec {
 
 // Deliberately tuned so trade-offs bite: reactors are heavy and hot but the only power
 // source; engines add thrust yet burn fuel and draw power; cargo is pure dead mass.
+// These are PER-CELL base values; a module's contribution is scaled by its footprint.
 const SPECS: Record<ModuleType, ModuleSpec> = {
   reactor: { mass: 8, power: 12, heat: 4, thrust: 0, fuelBurn: 0, fuelCap: 0, dps: 0, shieldHP: 0, cargoCap: 0, color: "#ffd24d" },
   engine: { mass: 6, power: -2, heat: 2, thrust: 12, fuelBurn: 2, fuelCap: 0, dps: 0, shieldHP: 0, cargoCap: 0, color: "#ff8a3b" },
@@ -56,7 +78,9 @@ interface PrefabDef {
   modules: (Cell & { type: ModuleType })[];
 }
 
-// Both prefabs are hand-authored to validate clean under every rule below.
+// Both prefabs are hand-authored to validate clean under every rule below. Every module
+// is size "S": the prefab stats are regression baselines (fighter mass 42 / speed 34.3 /
+// power balance 1; trader mass 78 / cargo 80) and must not shift when sizes were added.
 const PREFABS: Record<PrefabName, PrefabDef> = {
   // Fighter: excellent movement (3 engines / low mass), no cargo, tight power budget.
   fighter: {
@@ -101,13 +125,20 @@ const PREFABS: Record<PrefabName, PrefabDef> = {
 
 interface Module {
   type: ModuleType;
+  size: ModuleSize;
+  // Anchor = the module's minimum corner cell; the footprint occupies
+  // [x, x+dx) x [y, y+dy) x [z, z+dz). dims are derived from size at creation.
   x: number;
   y: number;
   z: number;
+  dx: number;
+  dy: number;
+  dz: number;
   mesh: THREE.Mesh;
   // Each module owns its material: validity red-tint, selection glow and the
   // performance heat-lerp are all per-module, so a shared per-type material can't
-  // express them. The BoxGeometry, by contrast, is shared across every module.
+  // express them. The BoxGeometry (one per size) and the icon texture (one per
+  // type+size) are, by contrast, shared across every matching module.
   material: THREE.MeshStandardMaterial;
 }
 
@@ -123,6 +154,140 @@ const BOX_EDGES: [number, number][] = [
 ];
 
 const RED = new THREE.Color("#ff3b3b");
+
+// The six orthogonal neighbor directions, shared by adjacency / connectivity scans.
+const DIRS: THREE.Vector3Tuple[] = [[1, 0, 0], [-1, 0, 0], [0, 1, 0], [0, -1, 0], [0, 0, 1], [0, 0, -1]];
+
+// ---- pictographic icon textures ------------------------------------------------------
+// Module colors alone are unreadable on a phone, so every block wears a white
+// pictogram baked onto a colored tile (like classic ship-editor games). Glyphs are drawn
+// with canvas 2D paths — NOT emoji/text — because emoji rendering varies across
+// platforms. One 128x128 texture per (type, size); the size label is stamped in the
+// corner. A soft dark shadow backs the white strokes so they read on light tiles too.
+function drawGlyph(g: CanvasRenderingContext2D, type: ModuleType): void {
+  g.strokeStyle = "#ffffff";
+  g.fillStyle = "#ffffff";
+  g.lineWidth = 9;
+  g.lineJoin = "round";
+  g.lineCap = "round";
+  switch (type) {
+    case "reactor": {
+      // Lightning bolt, filled polygon.
+      g.beginPath();
+      g.moveTo(72, 22);
+      g.lineTo(42, 70);
+      g.lineTo(60, 70);
+      g.lineTo(52, 106);
+      g.lineTo(88, 56);
+      g.lineTo(68, 56);
+      g.closePath();
+      g.fill();
+      break;
+    }
+    case "engine": {
+      // Nozzle trapezoid (narrow top, flared bottom) with 3 flame strokes below.
+      g.beginPath();
+      g.moveTo(50, 32);
+      g.lineTo(78, 32);
+      g.lineTo(90, 74);
+      g.lineTo(38, 74);
+      g.closePath();
+      g.fill();
+      g.beginPath();
+      g.moveTo(50, 80); g.lineTo(46, 104);
+      g.moveTo(64, 80); g.lineTo(64, 108);
+      g.moveTo(78, 80); g.lineTo(82, 104);
+      g.stroke();
+      break;
+    }
+    case "fuel": {
+      // Droplet outline: a top tip curving down to a rounded bottom bulge.
+      g.beginPath();
+      g.moveTo(64, 22);
+      g.quadraticCurveTo(90, 62, 90, 82);
+      g.arc(64, 82, 26, 0, Math.PI);
+      g.quadraticCurveTo(38, 62, 64, 22);
+      g.closePath();
+      g.stroke();
+      break;
+    }
+    case "weapon": {
+      // Crosshair: ring + 4 ticks + center dot.
+      g.beginPath();
+      g.arc(64, 64, 30, 0, Math.PI * 2);
+      g.stroke();
+      g.beginPath();
+      g.moveTo(64, 18); g.lineTo(64, 38);
+      g.moveTo(64, 90); g.lineTo(64, 110);
+      g.moveTo(18, 64); g.lineTo(38, 64);
+      g.moveTo(90, 64); g.lineTo(110, 64);
+      g.stroke();
+      g.beginPath();
+      g.arc(64, 64, 5, 0, Math.PI * 2);
+      g.fill();
+      break;
+    }
+    case "shield": {
+      // Classic shield: broad top, tapering to a point at the bottom.
+      g.beginPath();
+      g.moveTo(32, 34);
+      g.quadraticCurveTo(64, 24, 96, 34);
+      g.lineTo(96, 64);
+      g.quadraticCurveTo(96, 92, 64, 106);
+      g.quadraticCurveTo(32, 92, 32, 64);
+      g.closePath();
+      g.stroke();
+      break;
+    }
+    case "cargo": {
+      // Crate: square with an X brace.
+      g.strokeRect(34, 34, 60, 60);
+      g.beginPath();
+      g.moveTo(34, 34); g.lineTo(94, 94);
+      g.moveTo(94, 34); g.lineTo(34, 94);
+      g.stroke();
+      break;
+    }
+    case "crew": {
+      // Person: circular head above a shoulders arc.
+      g.beginPath();
+      g.arc(64, 44, 16, 0, Math.PI * 2);
+      g.stroke();
+      g.beginPath();
+      g.arc(64, 104, 34, Math.PI, Math.PI * 2);
+      g.stroke();
+      break;
+    }
+  }
+}
+function makeIconTexture(type: ModuleType, size: ModuleSize): THREE.CanvasTexture {
+  const canvas = document.createElement("canvas");
+  canvas.width = 128;
+  canvas.height = 128;
+  const g = canvas.getContext("2d") as CanvasRenderingContext2D;
+
+  // Background = the module type's color (so unlit/exterior views still read by hue).
+  g.fillStyle = SPECS[type].color;
+  g.fillRect(0, 0, 128, 128);
+
+  // Soft dark backing keeps the white glyph legible on light tiles (crew/fuel/reactor).
+  g.shadowColor = "rgba(0,0,0,0.45)";
+  g.shadowBlur = 6;
+  g.shadowOffsetX = 2;
+  g.shadowOffsetY = 2;
+  drawGlyph(g, type);
+
+  // Size label, small, bottom-right corner.
+  g.font = "bold 30px sans-serif";
+  g.textAlign = "right";
+  g.textBaseline = "alphabetic";
+  g.fillStyle = "#ffffff";
+  g.fillText(size, 122, 122);
+
+  const tex = new THREE.CanvasTexture(canvas);
+  tex.colorSpace = THREE.SRGBColorSpace;
+  return tex;
+}
 
 function setup(ctx: SceneContext): SceneInstance {
   const { scene, gui, camera, controls, canvas } = ctx;
@@ -148,8 +313,39 @@ function setup(ctx: SceneContext): SceneInstance {
   dirLight.position.set(20, 30, 10);
   scene.add(ambient, dirLight);
 
-  const moduleGeometry = new THREE.BoxGeometry(CELL * 0.86, CELL * 0.86, CELL * 0.86);
-  const highlightGeometry = new THREE.BoxGeometry(CELL * 0.92, CELL * 0.92, CELL * 0.92);
+  // One box geometry per size, shared across every module of that size; likewise one
+  // slightly larger box per size for the placement ghosts. Both caches are disposed at
+  // teardown (modules only own/dispose their material, never the shared geometry).
+  const moduleGeomCache = new Map<ModuleSize, THREE.BoxGeometry>();
+  const ghostGeomCache = new Map<ModuleSize, THREE.BoxGeometry>();
+  function moduleGeometryFor(size: ModuleSize): THREE.BoxGeometry {
+    let g = moduleGeomCache.get(size);
+    if (!g) {
+      const [dx, dy, dz] = SIZE_DIMS[size];
+      g = new THREE.BoxGeometry(dx * CELL * 0.86, dy * CELL * 0.86, dz * CELL * 0.86);
+      moduleGeomCache.set(size, g);
+    }
+    return g;
+  }
+  function ghostGeometryFor(size: ModuleSize): THREE.BoxGeometry {
+    let g = ghostGeomCache.get(size);
+    if (!g) {
+      const [dx, dy, dz] = SIZE_DIMS[size];
+      g = new THREE.BoxGeometry(dx * CELL * 0.92, dy * CELL * 0.92, dz * CELL * 0.92);
+      ghostGeomCache.set(size, g);
+    }
+    return g;
+  }
+
+  // 7 types x 4 sizes = 28 icon textures, generated once and disposed at teardown.
+  const iconTextures = new Map<string, THREE.CanvasTexture>();
+  const iconKey = (type: ModuleType, size: ModuleSize): string => `${type}:${size}`;
+  for (const type of MODULE_TYPES) {
+    for (const size of MODULE_SIZES) {
+      iconTextures.set(iconKey(type, size), makeIconTexture(type, size));
+    }
+  }
+
   const highlightMaterial = new THREE.MeshBasicMaterial({
     color: "#43f08a",
     transparent: true,
@@ -175,24 +371,28 @@ function setup(ctx: SceneContext): SceneInstance {
   let selected: Module | null = null;
   let mode: EditMode = "idle";
   let pendingType: ModuleType | null = null; // module type awaiting placement in "add" mode.
+  let pendingSize: ModuleSize | null = null; // module size awaiting placement in "add" mode.
 
   const highlightMeshes: THREE.Mesh[] = [];
-  const highlightMap = new Map<THREE.Object3D, Cell>();
+  const highlightMap = new Map<THREE.Object3D, Cell>(); // ghost mesh -> placement anchor.
   const meshToModule = new Map<THREE.Object3D, Module>();
 
   const state = {
     view: "internal" as ViewMode,
     prefab: "fighter" as PrefabName,
     paletteType: "cargo" as ModuleType,
+    paletteSize: "S" as ModuleSize,
     hullColor: "#5a6b8c",
     hullStyle: "plated" as HullStyle,
   };
-  const readout = { status: "OK — layout valid" };
+  const readout = { status: "OK — layout valid", selected: "—" };
   const perf = {
     mass: 0, thrust: 0, speed: 0, turn: 0,
     powerGen: 0, powerUse: 0, powerBalance: 0, heat: 0,
     shieldHP: 0, dps: 0, cargoCap: 0, fuelCap: 0, burn: 0, range: 0,
   };
+
+  const round1 = (v: number): number => Math.round(v * 10) / 10;
 
   // ---- geometry helpers -------------------------------------------------------------
   function cellX(x: number): number {
@@ -207,24 +407,70 @@ function setup(ctx: SceneContext): SceneInstance {
   function isExteriorCell(x: number, y: number, z: number): boolean {
     return x === 0 || x === w - 1 || y === 0 || y === h - 1 || z === 0 || z === d - 1;
   }
+  // World-space center of a footprint anchored at (x,y,z) with dims (dx,dy,dz).
+  function footprintCenter(x: number, y: number, z: number, dx: number, dy: number, dz: number): THREE.Vector3 {
+    return new THREE.Vector3(cellX(x + (dx - 1) / 2), cellY(y + (dy - 1) / 2), cellZ(z + (dz - 1) / 2));
+  }
   function occupantAt(x: number, y: number, z: number): Module | null {
-    // Layouts are tiny (<40 modules) so a linear scan is cheaper than maintaining a map.
-    return modules.find((m) => m.x === x && m.y === y && m.z === z) ?? null;
-  }
-  function neighbors(m: Module): Module[] {
-    const out: Module[] = [];
-    const dirs: THREE.Vector3Tuple[] = [[1, 0, 0], [-1, 0, 0], [0, 1, 0], [0, -1, 0], [0, 0, 1], [0, 0, -1]];
-    for (const [dx, dy, dz] of dirs) {
-      const n = occupantAt(m.x + dx, m.y + dy, m.z + dz);
-      if (n) out.push(n);
+    // Layouts are tiny (<40 modules, footprints <=8 cells) so a linear scan over
+    // modules and their footprints is cheaper than maintaining a cell->module map.
+    for (const m of modules) {
+      if (x >= m.x && x < m.x + m.dx && y >= m.y && y < m.y + m.dy && z >= m.z && z < m.z + m.dz) return m;
     }
-    return out;
+    return null;
   }
-  function hasOccupiedNeighbor(x: number, y: number, z: number, exclude: Module | null): boolean {
-    const dirs: THREE.Vector3Tuple[] = [[1, 0, 0], [-1, 0, 0], [0, 1, 0], [0, -1, 0], [0, 0, 1], [0, 0, -1]];
-    for (const [dx, dy, dz] of dirs) {
-      const n = occupantAt(x + dx, y + dy, z + dz);
-      if (n && n !== exclude) return true;
+  // Connectivity: two modules are connected if ANY cell of one is orthogonally adjacent
+  // to ANY cell of the other. Scan every footprint cell's six neighbors.
+  function neighbors(m: Module): Module[] {
+    const found = new Set<Module>();
+    for (let ix = m.x; ix < m.x + m.dx; ix++) {
+      for (let iy = m.y; iy < m.y + m.dy; iy++) {
+        for (let iz = m.z; iz < m.z + m.dz; iz++) {
+          for (const [dx, dy, dz] of DIRS) {
+            const n = occupantAt(ix + dx, iy + dy, iz + dz);
+            if (n && n !== m) found.add(n);
+          }
+        }
+      }
+    }
+    return [...found];
+  }
+
+  // ---- footprint predicates (used by placement + validation) ------------------------
+  // Every footprint cell is free (ignoring `exclude`, the module being moved).
+  function footprintFree(x: number, y: number, z: number, dx: number, dy: number, dz: number, exclude: Module | null): boolean {
+    for (let ix = x; ix < x + dx; ix++) {
+      for (let iy = y; iy < y + dy; iy++) {
+        for (let iz = z; iz < z + dz; iz++) {
+          const occ = occupantAt(ix, iy, iz);
+          if (occ && occ !== exclude) return false;
+        }
+      }
+    }
+    return true;
+  }
+  // At least one footprint cell lies on a grid boundary (weapon hardpoint rule).
+  function footprintExterior(x: number, y: number, z: number, dx: number, dy: number, dz: number): boolean {
+    for (let ix = x; ix < x + dx; ix++) {
+      for (let iy = y; iy < y + dy; iy++) {
+        for (let iz = z; iz < z + dz; iz++) {
+          if (isExteriorCell(ix, iy, iz)) return true;
+        }
+      }
+    }
+    return false;
+  }
+  // At least one footprint cell is orthogonally adjacent to another module's cell.
+  function footprintHasNeighbor(x: number, y: number, z: number, dx: number, dy: number, dz: number, exclude: Module | null): boolean {
+    for (let ix = x; ix < x + dx; ix++) {
+      for (let iy = y; iy < y + dy; iy++) {
+        for (let iz = z; iz < z + dz; iz++) {
+          for (const [ddx, ddy, ddz] of DIRS) {
+            const n = occupantAt(ix + ddx, iy + ddy, iz + ddz);
+            if (n && n !== exclude) return true;
+          }
+        }
+      }
     }
     return false;
   }
@@ -254,15 +500,23 @@ function setup(ctx: SceneContext): SceneInstance {
   }
 
   // ---- module lifecycle -------------------------------------------------------------
-  function positionMesh(mesh: THREE.Object3D, x: number, y: number, z: number): void {
-    mesh.position.set(cellX(x), cellY(y), cellZ(z));
+  function positionModuleMesh(mesh: THREE.Object3D, m: Module): void {
+    mesh.position.copy(footprintCenter(m.x, m.y, m.z, m.dx, m.dy, m.dz));
   }
-  function addModuleAt(type: ModuleType, x: number, y: number, z: number): Module {
-    const material = new THREE.MeshStandardMaterial({ color: SPECS[type].color, metalness: 0.2, roughness: 0.6 });
-    const mesh = new THREE.Mesh(moduleGeometry, material);
-    positionMesh(mesh, x, y, z);
+  function addModuleAt(type: ModuleType, size: ModuleSize, x: number, y: number, z: number): Module {
+    const [dx, dy, dz] = SIZE_DIMS[size];
+    // Base color WHITE so the icon texture's baked colors show true; restyle() drives the
+    // per-state tints (invalid red / heat lerp) as multiplies over the texture.
+    const material = new THREE.MeshStandardMaterial({
+      color: "#ffffff",
+      map: iconTextures.get(iconKey(type, size)) ?? null,
+      metalness: 0.2,
+      roughness: 0.6,
+    });
+    const mesh = new THREE.Mesh(moduleGeometryFor(size), material);
+    const m: Module = { type, size, x, y, z, dx, dy, dz, mesh, material };
+    positionModuleMesh(mesh, m);
     moduleGroup.add(mesh);
-    const m: Module = { type, x, y, z, mesh, material };
     modules.push(m);
     meshToModule.set(mesh, m);
     return m;
@@ -270,7 +524,7 @@ function setup(ctx: SceneContext): SceneInstance {
   function removeModule(m: Module): void {
     moduleGroup.remove(m.mesh);
     meshToModule.delete(m.mesh);
-    m.material.dispose();
+    m.material.dispose(); // shared geometry + shared texture are NOT disposed here.
     const i = modules.indexOf(m);
     if (i >= 0) modules.splice(i, 1);
     if (selected === m) selected = null;
@@ -285,10 +539,11 @@ function setup(ctx: SceneContext): SceneInstance {
     selected = null;
   }
   function moveModule(m: Module, x: number, y: number, z: number): void {
+    // Size (and therefore dims) never changes on a move — only the anchor.
     m.x = x;
     m.y = y;
     m.z = z;
-    positionMesh(m.mesh, x, y, z);
+    positionModuleMesh(m.mesh, m);
   }
 
   // ---- highlights -------------------------------------------------------------------
@@ -297,28 +552,35 @@ function setup(ctx: SceneContext): SceneInstance {
     highlightMeshes.length = 0;
     highlightMap.clear();
   }
-  function showHighlights(cells: Cell[]): void {
+  // One translucent green GHOST BOX (the module's full footprint) at each valid anchor.
+  // Tapping a ghost places/moves the module to that anchor.
+  function showAnchorHighlights(size: ModuleSize, anchors: Cell[]): void {
     clearHighlights();
-    for (const c of cells) {
-      const mesh = new THREE.Mesh(highlightGeometry, highlightMaterial);
-      positionMesh(mesh, c.x, c.y, c.z);
+    const [dx, dy, dz] = SIZE_DIMS[size];
+    const geom = ghostGeometryFor(size);
+    for (const a of anchors) {
+      const mesh = new THREE.Mesh(geom, highlightMaterial);
+      mesh.position.copy(footprintCenter(a.x, a.y, a.z, dx, dy, dz));
       highlightGroup.add(mesh);
       highlightMeshes.push(mesh);
-      highlightMap.set(mesh, c);
+      highlightMap.set(mesh, a);
     }
   }
-  // Cheap adjacency proxy for connectivity: a placement is offered only if it keeps the
-  // module's positional rule (engine→rear, weapon→exterior) AND touches an existing
-  // module. Full re-validation runs after the move regardless.
-  function validEmptyCells(type: ModuleType, exclude: Module | null): Cell[] {
+  // Valid placement anchors for a (type,size) module, excluding `exclude` (the module
+  // being moved) from occupancy/adjacency: the footprint must fit fully inside the grid,
+  // all its cells must be free, at least one cell must touch another module, and the
+  // per-type positional rule (engine rear / weapon exterior) must hold at that anchor.
+  // Full re-validation still runs after the edit regardless.
+  function validAnchors(type: ModuleType, size: ModuleSize, exclude: Module | null): Cell[] {
+    const [dx, dy, dz] = SIZE_DIMS[size];
     const out: Cell[] = [];
-    for (let x = 0; x < w; x++) {
-      for (let y = 0; y < h; y++) {
-        for (let z = 0; z < d; z++) {
-          if (occupantAt(x, y, z)) continue;
-          if (type === "engine" && z !== d - 1) continue;
-          if (type === "weapon" && !isExteriorCell(x, y, z)) continue;
-          if (!hasOccupiedNeighbor(x, y, z, exclude)) continue;
+    for (let x = 0; x + dx <= w; x++) {
+      for (let y = 0; y + dy <= h; y++) {
+        for (let z = 0; z + dz <= d; z++) {
+          if (!footprintFree(x, y, z, dx, dy, dz, exclude)) continue;
+          if (type === "engine" && z + dz - 1 !== d - 1) continue;
+          if (type === "weapon" && !footprintExterior(x, y, z, dx, dy, dz)) continue;
+          if (!footprintHasNeighbor(x, y, z, dx, dy, dz, exclude)) continue;
           out.push({ x, y, z });
         }
       }
@@ -351,34 +613,40 @@ function setup(ctx: SceneContext): SceneInstance {
   }
 
   function recomputeStats(): void {
+    // Mass and all CONSUMPTION stats (power draw, heat, fuel burn) scale by cell count
+    // alone. All OUTPUT stats (power gen, thrust, dps, shield, cargo, fuel cap) scale by
+    // cells × the size-efficiency multiplier — bigger blocks give more output per mass.
     let mass = 0, thrust = 0, powerGen = 0, powerUse = 0, heat = 0;
     let shieldHP = 0, dps = 0, cargoCap = 0, fuelCap = 0, burn = 0;
     for (const m of modules) {
       const s = SPECS[m.type];
-      mass += s.mass;
-      thrust += s.thrust;
-      if (s.power > 0) powerGen += s.power;
-      else powerUse += -s.power;
-      heat += s.heat;
-      shieldHP += s.shieldHP;
-      dps += s.dps;
-      cargoCap += s.cargoCap;
-      fuelCap += s.fuelCap;
-      burn += s.fuelBurn;
+      const cells = m.dx * m.dy * m.dz;
+      const eff = SIZE_EFFICIENCY[m.size];
+      const out = cells * eff;
+      mass += s.mass * cells;
+      thrust += s.thrust * out;
+      if (s.power > 0) powerGen += s.power * out;
+      else powerUse += -s.power * cells;
+      heat += s.heat * cells;
+      shieldHP += s.shieldHP * out;
+      dps += s.dps * out;
+      cargoCap += s.cargoCap * out;
+      fuelCap += s.fuelCap * out;
+      burn += s.fuelBurn * cells;
     }
-    perf.mass = mass;
-    perf.thrust = thrust;
-    perf.speed = mass > 0 ? Math.round((thrust / mass) * 400) / 10 : 0;
-    perf.turn = mass > 0 ? Math.round((thrust / mass) * 600) / 10 : 0;
-    perf.powerGen = powerGen;
-    perf.powerUse = powerUse;
-    perf.powerBalance = powerGen - powerUse;
-    perf.heat = heat;
-    perf.shieldHP = shieldHP;
-    perf.dps = dps;
-    perf.cargoCap = cargoCap;
-    perf.fuelCap = fuelCap;
-    perf.burn = burn;
+    perf.mass = round1(mass);
+    perf.thrust = round1(thrust);
+    perf.speed = mass > 0 ? round1((thrust / mass) * 40) : 0;
+    perf.turn = mass > 0 ? round1((thrust / mass) * 60) : 0;
+    perf.powerGen = round1(powerGen);
+    perf.powerUse = round1(powerUse);
+    perf.powerBalance = round1(powerGen - powerUse);
+    perf.heat = round1(heat);
+    perf.shieldHP = round1(shieldHP);
+    perf.dps = round1(dps);
+    perf.cargoCap = round1(cargoCap);
+    perf.fuelCap = round1(fuelCap);
+    perf.burn = round1(burn);
     perf.range = burn > 0 ? Math.round((fuelCap / burn) * perf.speed) : 0;
   }
 
@@ -395,13 +663,13 @@ function setup(ctx: SceneContext): SceneInstance {
 
     if (perf.powerBalance < 0) issues.push("power deficit");
 
-    // Rule 3: every engine must sit in the rearmost layer (direct rear access).
-    const offRear = modules.filter((m) => m.type === "engine" && m.z !== d - 1);
+    // Rule 3: every engine's rearmost cell layer (anchor.z + dz - 1) must be the rear.
+    const offRear = modules.filter((m) => m.type === "engine" && m.z + m.dz - 1 !== d - 1);
     for (const m of offRear) offending.add(m);
     if (offRear.length > 0) issues.push(`${offRear.length > 1 ? `${offRear.length} engines` : "engine"} off rear`);
 
-    // Rule 4: every weapon must sit on an exterior cell (external hardpoint).
-    const interior = modules.filter((m) => m.type === "weapon" && !isExteriorCell(m.x, m.y, m.z));
+    // Rule 4: every weapon must have at least one exterior footprint cell (a hardpoint).
+    const interior = modules.filter((m) => m.type === "weapon" && !footprintExterior(m.x, m.y, m.z, m.dx, m.dy, m.dz));
     for (const m of interior) offending.add(m);
     if (interior.length > 0) issues.push(`${interior.length > 1 ? `${interior.length} weapons` : "weapon"} interior`);
 
@@ -416,11 +684,20 @@ function setup(ctx: SceneContext): SceneInstance {
       : `${issues.length} issue${issues.length > 1 ? "s" : ""}: ${issues.join("; ")}`;
   }
 
+  function selectionLabel(): string {
+    if (!selected) return "—";
+    const cells = selected.dx * selected.dy * selected.dz;
+    return `${selected.type} ${selected.size} (${cells} cell${cells > 1 ? "s" : ""})`;
+  }
+
   // ---- visual styling ---------------------------------------------------------------
   function restyle(): void {
+    readout.selected = selectionLabel();
     for (const m of modules) {
-      const base = SPECS[m.type].color;
-      m.material.color.set(base);
+      // Emissive still uses the type color for selection/baseline self-glow (unchanged);
+      // only the diffuse base color moved to white so the icon texture reads true.
+      const glow = SPECS[m.type].color;
+      m.material.color.set("#ffffff");
       if (state.view === "performance") {
         // Glanceable "where does the heat come from" view: lerp toward red,
         // normalized by the HOTTEST module type on board (not total ship
@@ -433,16 +710,19 @@ function setup(ctx: SceneContext): SceneInstance {
       const invalid = offending.has(m);
       const isSel = m === selected;
       if (invalid) {
+        // Tint the diffuse toward red so a rule-breaking block reads at a glance, on
+        // top of the red emissive.
+        m.material.color.copy(RED);
         m.material.emissive.set("#ff2a2a");
         m.material.emissiveIntensity = 0.7;
       } else if (isSel) {
-        m.material.emissive.set(base);
+        m.material.emissive.set(glow);
         m.material.emissiveIntensity = 0.9;
       } else {
         // Baseline self-glow so module colors stay readable against the
         // near-black background — lit-only shading left them too dark to
         // tell types apart on a phone screen.
-        m.material.emissive.set(base);
+        m.material.emissive.set(glow);
         m.material.emissiveIntensity = 0.35;
       }
       m.mesh.scale.setScalar(isSel ? 1.12 : 1);
@@ -460,17 +740,23 @@ function setup(ctx: SceneContext): SceneInstance {
     for (const g of geometries) g.dispose();
     hullGroup.clear();
   }
-  function addEngineNozzles(rearZFor: (m: Module) => number): void {
-    // A short nozzle protruding from the rear at each engine's (x,y) — the
-    // hull visibly reflects the propulsion layout, whichever style is on.
+  function addEngineNozzles(rearPlaneZFor: (m: Module) => number): void {
+    // One nozzle per engine footprint cell on the engine's rear face — an XL engine
+    // (2x2 rear layer) gets a 2x2 nozzle cluster. The hull visibly reflects the
+    // propulsion layout, whichever style is on.
     const nozzleLen = 0.9 * CELL;
     const nozzleGeometry = new THREE.CylinderGeometry(0.35 * CELL, 0.35 * CELL, nozzleLen, 12);
     for (const m of modules) {
       if (m.type !== "engine") continue;
-      const nozzle = new THREE.Mesh(nozzleGeometry, nozzleMaterial);
-      nozzle.rotation.x = Math.PI / 2; // align cylinder's y axis with +z
-      nozzle.position.set(cellX(m.x), cellY(m.y), rearZFor(m) + nozzleLen / 2 - 0.1);
-      hullGroup.add(nozzle);
+      const rz = rearPlaneZFor(m);
+      for (let ix = m.x; ix < m.x + m.dx; ix++) {
+        for (let iy = m.y; iy < m.y + m.dy; iy++) {
+          const nozzle = new THREE.Mesh(nozzleGeometry, nozzleMaterial);
+          nozzle.rotation.x = Math.PI / 2; // align cylinder's y axis with +z
+          nozzle.position.set(cellX(ix), cellY(iy), rz + nozzleLen / 2 - 0.1);
+          hullGroup.add(nozzle);
+        }
+      }
     }
   }
   function buildHull(): void {
@@ -479,7 +765,7 @@ function setup(ctx: SceneContext): SceneInstance {
     if (state.hullStyle === "plated") buildPlatedHull();
     else buildBoxHull();
   }
-  // Form-fitting "skin": one slightly-inflated armor plate per occupied cell
+  // Form-fitting "skin": one slightly-inflated armor plate per occupied CELL
   // that has at least one exposed face, so the hull silhouette IS the module
   // layout (an arrowhead fighter reads as an arrowhead, a cargo spine reads
   // as a slab). Plates overlap their neighbors, which welds them into a
@@ -488,29 +774,39 @@ function setup(ctx: SceneContext): SceneInstance {
   function buildPlatedHull(): void {
     const plateGeometry = new THREE.BoxGeometry(CELL * 1.3, CELL * 1.3, CELL * 1.3);
     for (const m of modules) {
-      const enclosed =
-        occupantAt(m.x + 1, m.y, m.z) && occupantAt(m.x - 1, m.y, m.z) &&
-        occupantAt(m.x, m.y + 1, m.z) && occupantAt(m.x, m.y - 1, m.z) &&
-        occupantAt(m.x, m.y, m.z + 1) && occupantAt(m.x, m.y, m.z - 1);
-      if (enclosed) continue; // fully interior — its plate would never be seen
-      const plate = new THREE.Mesh(plateGeometry, hullMaterial);
-      plate.position.set(cellX(m.x), cellY(m.y), cellZ(m.z));
-      hullGroup.add(plate);
+      for (let ix = m.x; ix < m.x + m.dx; ix++) {
+        for (let iy = m.y; iy < m.y + m.dy; iy++) {
+          for (let iz = m.z; iz < m.z + m.dz; iz++) {
+            // Enclosed = all six cell-neighbors occupied (by any module, self included).
+            const enclosed =
+              occupantAt(ix + 1, iy, iz) && occupantAt(ix - 1, iy, iz) &&
+              occupantAt(ix, iy + 1, iz) && occupantAt(ix, iy - 1, iz) &&
+              occupantAt(ix, iy, iz + 1) && occupantAt(ix, iy, iz - 1);
+            if (enclosed) continue; // fully interior — its plate would never be seen
+            const plate = new THREE.Mesh(plateGeometry, hullMaterial);
+            plate.position.set(cellX(ix), cellY(iy), cellZ(iz));
+            hullGroup.add(plate);
+          }
+        }
+      }
     }
-    addEngineNozzles((m) => cellZ(m.z) + (CELL * 1.3) / 2);
+    // Rear plane of an engine = the world z of its rearmost cell layer + half a plate.
+    addEngineNozzles((m) => cellZ(m.z + m.dz - 1) + (CELL * 1.3) / 2);
   }
   // The original single-shell alternative, kept for comparison: an inflated
   // box over the installed modules' bounding volume with a cone nose.
   function buildBoxHull(): void {
-    // Bounding box of the INSTALLED modules — this is why the hull visibly re-fits when
-    // modules are added, moved or removed.
+    // Bounding box of the INSTALLED modules' footprints — this is why the hull visibly
+    // re-fits when modules are added, moved or removed.
     let minX = Infinity, minY = Infinity, minZ = Infinity;
     let maxX = -Infinity, maxY = -Infinity, maxZ = -Infinity;
     for (const m of modules) {
-      const px = cellX(m.x), py = cellY(m.y), pz = cellZ(m.z);
-      minX = Math.min(minX, px); maxX = Math.max(maxX, px);
-      minY = Math.min(minY, py); maxY = Math.max(maxY, py);
-      minZ = Math.min(minZ, pz); maxZ = Math.max(maxZ, pz);
+      const loX = cellX(m.x), hiX = cellX(m.x + m.dx - 1);
+      const loY = cellY(m.y), hiY = cellY(m.y + m.dy - 1);
+      const loZ = cellZ(m.z), hiZ = cellZ(m.z + m.dz - 1);
+      minX = Math.min(minX, loX); maxX = Math.max(maxX, hiX);
+      minY = Math.min(minY, loY); maxY = Math.max(maxY, hiY);
+      minZ = Math.min(minZ, loZ); maxZ = Math.max(maxZ, hiZ);
     }
     const margin = 0.8 * CELL;
     const sx = (maxX - minX) + 2 * margin;
@@ -571,12 +867,14 @@ function setup(ctx: SceneContext): SceneInstance {
     clearModules();
     mode = "idle";
     pendingType = null;
+    pendingSize = null;
     const p = PREFABS[name];
     w = p.w;
     h = p.h;
     d = p.d;
     rebuildGrid();
-    for (const def of p.modules) addModuleAt(def.type, def.x, def.y, def.z);
+    // Prefabs are all size "S" — their baked-in stats are regression baselines.
+    for (const def of p.modules) addModuleAt(def.type, "S", def.x, def.y, def.z);
     state.hullColor = p.hullColor;
     hullMaterial.color.set(p.hullColor);
     hullColorCtrl.updateDisplay();
@@ -590,17 +888,19 @@ function setup(ctx: SceneContext): SceneInstance {
     selected = m;
     mode = "move";
     pendingType = null;
-    showHighlights(validEmptyCells(m.type, m));
+    pendingSize = null;
+    showAnchorHighlights(m.size, validAnchors(m.type, m.size, m));
     restyle();
   }
   function tapHighlight(cell: Cell): void {
     if (mode === "move" && selected) {
       moveModule(selected, cell.x, cell.y, cell.z);
-    } else if (mode === "add" && pendingType) {
-      selected = addModuleAt(pendingType, cell.x, cell.y, cell.z);
+    } else if (mode === "add" && pendingType && pendingSize) {
+      selected = addModuleAt(pendingType, pendingSize, cell.x, cell.y, cell.z);
     }
     mode = "idle";
     pendingType = null;
+    pendingSize = null;
     clearHighlights();
     onLayoutChanged();
   }
@@ -608,6 +908,7 @@ function setup(ctx: SceneContext): SceneInstance {
     selected = null;
     mode = "idle";
     pendingType = null;
+    pendingSize = null;
     clearHighlights();
     restyle();
   }
@@ -671,23 +972,28 @@ function setup(ctx: SceneContext): SceneInstance {
   canvas.addEventListener("pointercancel", onPointerCancel, { passive: true });
 
   // ---- repair -----------------------------------------------------------------------
-  function firstFreeCell(cells: Cell[], exclude: Module): Cell | null {
-    for (const c of cells) {
-      if (occupantAt(c.x, c.y, c.z)) continue;
-      if (hasOccupiedNeighbor(c.x, c.y, c.z, exclude)) return c;
+  // Nearest valid anchor for a module (nearest-first by cell distance from its current
+  // anchor). Excludes the module itself from occupancy/adjacency.
+  function nearestValidAnchor(m: Module): Cell | null {
+    let best: Cell | null = null;
+    let bestD = Infinity;
+    for (const a of validAnchors(m.type, m.size, m)) {
+      const dd = Math.abs(a.x - m.x) + Math.abs(a.y - m.y) + Math.abs(a.z - m.z);
+      if (dd < bestD) {
+        bestD = dd;
+        best = a;
+      }
     }
-    return null;
+    return best;
   }
   function repair(): void {
     const done: string[] = [];
 
-    // (a) Off-rear engines → a free rear-layer cell adjacent to something.
+    // (a) Off-rear engines → nearest valid anchor (footprint fits, rear rule holds, touches).
     let enginesMoved = 0;
     for (const m of modules) {
-      if (m.type !== "engine" || m.z === d - 1) continue;
-      const rearCells: Cell[] = [];
-      for (let x = 0; x < w; x++) for (let y = 0; y < h; y++) rearCells.push({ x, y, z: d - 1 });
-      const dest = firstFreeCell(rearCells, m);
+      if (m.type !== "engine" || m.z + m.dz - 1 === d - 1) continue;
+      const dest = nearestValidAnchor(m);
       if (dest) {
         moveModule(m, dest.x, dest.y, dest.z);
         enginesMoved++;
@@ -695,15 +1001,11 @@ function setup(ctx: SceneContext): SceneInstance {
     }
     if (enginesMoved > 0) done.push(`moved ${enginesMoved} engine${enginesMoved > 1 ? "s" : ""} to rear`);
 
-    // (b) Interior weapons → a free exterior cell adjacent to something.
+    // (b) Interior weapons → nearest valid anchor (exterior rule holds).
     let weaponsMoved = 0;
     for (const m of modules) {
-      if (m.type !== "weapon" || isExteriorCell(m.x, m.y, m.z)) continue;
-      const extCells: Cell[] = [];
-      for (let x = 0; x < w; x++) for (let y = 0; y < h; y++) for (let z = 0; z < d; z++) {
-        if (isExteriorCell(x, y, z)) extCells.push({ x, y, z });
-      }
-      const dest = firstFreeCell(extCells, m);
+      if (m.type !== "weapon" || footprintExterior(m.x, m.y, m.z, m.dx, m.dy, m.dz)) continue;
+      const dest = nearestValidAnchor(m);
       if (dest) {
         moveModule(m, dest.x, dest.y, dest.z);
         weaponsMoved++;
@@ -721,6 +1023,7 @@ function setup(ctx: SceneContext): SceneInstance {
     selected = null;
     mode = "idle";
     pendingType = null;
+    pendingSize = null;
     onLayoutChanged();
 
     let msg = done.length > 0 ? `Repaired: ${done.join("; ")}` : "Nothing to auto-repair";
@@ -733,26 +1036,35 @@ function setup(ctx: SceneContext): SceneInstance {
   const actions = {
     loadPrefab: () => loadPrefab(state.prefab),
     addModule: () => {
+      // Add uses the palette's type AND size.
       pendingType = state.paletteType;
+      pendingSize = state.paletteSize;
       mode = "add";
       selected = null;
-      showHighlights(validEmptyCells(pendingType, null));
+      showAnchorHighlights(pendingSize, validAnchors(pendingType, pendingSize, null));
       restyle();
     },
     duplicate: () => {
       if (!selected) return;
+      // Duplicate copies the SELECTED module's type + size, ignoring the palette.
       pendingType = selected.type;
+      pendingSize = selected.size;
       mode = "add";
-      showHighlights(validEmptyCells(pendingType, null));
+      showAnchorHighlights(pendingSize, validAnchors(pendingType, pendingSize, null));
       restyle();
     },
     replace: () => {
       if (!selected) return;
+      // Keep the selected module's size and anchor; only the type changes. Since size is
+      // unchanged the footprint is unchanged, so this is always safe to do in place —
+      // just swap the icon texture to the new type's.
       selected.type = state.paletteType;
-      selected.material.color.set(SPECS[state.paletteType].color);
+      selected.material.map = iconTextures.get(iconKey(selected.type, selected.size)) ?? null;
+      selected.material.needsUpdate = true;
       clearHighlights();
       mode = "idle";
       pendingType = null;
+      pendingSize = null;
       onLayoutChanged();
     },
     remove: () => {
@@ -762,6 +1074,7 @@ function setup(ctx: SceneContext): SceneInstance {
       clearHighlights();
       mode = "idle";
       pendingType = null;
+      pendingSize = null;
       onLayoutChanged();
     },
     repair,
@@ -782,13 +1095,15 @@ function setup(ctx: SceneContext): SceneInstance {
 
   const editFolder = gui.addFolder("Edit");
   editFolder.add(state, "paletteType", MODULE_TYPES).name("Module type");
-  editFolder.add(actions, "addModule").name("Add module (tap a green cell)");
+  editFolder.add(state, "paletteSize", MODULE_SIZES).name("Module size");
+  editFolder.add(readout, "selected").name("Selected").listen().disable();
+  editFolder.add(actions, "addModule").name("Add module (tap a green ghost)");
   editFolder.add(actions, "duplicate").name("Duplicate selected");
   editFolder.add(actions, "replace").name("Replace selected with palette type");
   editFolder.add(actions, "remove").name("Remove selected");
 
-  // Rotation is intentionally omitted: modules are single-slot in v1, so rotating one
-  // in place changes nothing — there's no orientation to a single cell.
+  // Rotation is intentionally omitted: orientations are fixed (see ModuleSize), so v1's
+  // single anchor tap fully determines a placement. Rotation returns when it earns it.
 
   const perfFolder = gui.addFolder("Performance");
   perfFolder.add(perf, "mass").name("Mass").listen().disable();
@@ -825,8 +1140,9 @@ function setup(ctx: SceneContext): SceneInstance {
       disposeHullMeshes();
       gridLines.geometry.dispose();
 
-      moduleGeometry.dispose();
-      highlightGeometry.dispose();
+      for (const g of moduleGeomCache.values()) g.dispose();
+      for (const g of ghostGeomCache.values()) g.dispose();
+      for (const t of iconTextures.values()) t.dispose();
       highlightMaterial.dispose();
       gridMaterial.dispose();
       hullMaterial.dispose();
