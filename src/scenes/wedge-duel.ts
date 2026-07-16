@@ -31,12 +31,19 @@ const FIGHTER_TURN_RATE_DEG = 100;
 const FIGHTER_TURN_PER_KILL = 4;
 const FIGHTER_TURN_RATE_CAP = 140;
 const FIGHTER_MAX_BANK_DEG = 42; // purely cosmetic roll into turns, doesn't affect physics
-const FIGHTER_MIN_RANGE = 45;
-const FIGHTER_MAX_RANGE = 100;
+// Jousting pass ranges (hysteresis): inside BREAK it commits to extending past /
+// away; only once beyond REENGAGE does it turn back in for another attack run.
+// A single "min range → reverse" threshold used to strand it next to the player
+// trying a 180° turn while braked to a taxi crawl — nose guns can't lock from that.
+const FIGHTER_BREAK_RANGE = 55;
+const FIGHTER_REENGAGE_RANGE = 120;
 const FIGHTER_FIRE_RANGE = 150;
 // Guns are nose-mounted — it has to actually be pointed close to the player
 // to fire, unlike the saucer's omnidirectional turret.
 const FIGHTER_FIRE_ALIGNMENT_MIN = 0.85;
+// Small lead off pure pursuit during an attack run so successive passes aren't
+// perfectly head-on rails (still well inside the fire-alignment cone).
+const FIGHTER_ATTACK_LEAD_DEG = 10;
 const FIGHTER_EVADE_LOOKAHEAD = 0.7;
 const FIGHTER_EVADE_RADIUS = 20;
 // While evading, the turn rate is boosted so the dodge reads as a distinct
@@ -64,9 +71,12 @@ interface Fighter {
   turnRate: number; // deg/s, scales with kills (set at spawn)
   hp: number;
   fireCooldown: number;
+  /** Attack run vs post-pass extend; hysteresis via BREAK/REENGAGE ranges. */
+  phase: "attack" | "extend";
   strafeSign: number;
   strafeTimer: number;
-  orbitAzimuth: number; // roll of the orbit plane around the line to the player
+  /** Roll of the pass-plane around the line to the player (attack lead axis). */
+  orbitAzimuth: number;
   evadeDir: THREE.Vector3;
   evadeTimer: number;
   /** Smoothed cosmetic bank angle (rad), applied on top of the physics quat. */
@@ -124,15 +134,15 @@ function randomDirection(): THREE.Vector3 {
 }
 
 /**
- * The conventional counterpart to Saucer Duel: same standoff-and-strafe,
- * dodge-the-incoming-laser decision logic, but a physically constrained
- * fighter rather than a holonomic disc. It turns its nose toward wherever it
- * wants to go at a capped rate and always thrusts along its CURRENT heading,
- * so — like the player — reversing direction means actually turning around,
- * not retargeting a velocity vector instantly. Its guns are nose-mounted, so
- * it only fires when actually pointed close to the player. The wedge shape
- * (plus a cosmetic bank into turns) makes that orientation readable at a
- * glance, which the saucer's disc never could.
+ * The conventional counterpart to Saucer Duel: same dodge-the-incoming-laser
+ * decision logic, but a physically constrained fighter rather than a holonomic
+ * disc. It jousts — attack runs toward the player while nose-guns are aligned,
+ * then when it gets too close it flies past / extends away and only turns back
+ * in once it has range again. It turns its nose toward wherever it wants to go
+ * at a capped rate and always thrusts along its CURRENT heading, so — like the
+ * player — reversing direction means actually turning around, not retargeting a
+ * velocity vector instantly. The wedge shape (plus a cosmetic bank into turns)
+ * makes that orientation readable at a glance, which the saucer's disc never could.
  */
 function setup(ctx: SceneContext): SceneInstance {
   const { scene, gui, camera, controls, canvas } = ctx;
@@ -269,6 +279,7 @@ function setup(ctx: SceneContext): SceneInstance {
       turnRate: Math.min(FIGHTER_TURN_RATE_CAP, FIGHTER_TURN_RATE_DEG + kills * FIGHTER_TURN_PER_KILL),
       hp: FIGHTER_HP,
       fireCooldown: THREE.MathUtils.lerp(0.4, 1.0, Math.random()),
+      phase: "attack",
       strafeSign: Math.random() < 0.5 ? 1 : -1,
       strafeTimer: 0,
       orbitAzimuth: Math.random() * Math.PI * 2,
@@ -301,6 +312,9 @@ function setup(ctx: SceneContext): SceneInstance {
     const dist = _toPlayer.length();
     if (dist > 0.0001) _toPlayerDir.copy(_toPlayer).normalize();
     else _toPlayerDir.copy(FORWARD);
+    // Nose for this frame — needed early for pass/extend steering (fly-past
+    // vs reverse) before the turn step updates it.
+    _forward.copy(FORWARD).applyQuaternion(active.quaternion);
 
     // Effective turn rate for this frame: the per-fighter (kill-scaled) rate,
     // boosted while jinking so an evade is a visibly sharper maneuver.
@@ -324,8 +338,7 @@ function setup(ctx: SceneContext): SceneInstance {
           // vector takes angle / rate seconds; a fixed 0.7s often expired
           // before the nose ever swung onto the dodge. Size the window to the
           // turn actually required (plus margin), capped so it can't loiter.
-          _prevForward.copy(FORWARD).applyQuaternion(active.quaternion);
-          const turnNeeded = _prevForward.angleTo(active.evadeDir);
+          const turnNeeded = _forward.angleTo(active.evadeDir);
           const boostedRateRad = THREE.MathUtils.degToRad(active.turnRate * FIGHTER_EVADE_TURN_MULT);
           active.evadeTimer = Math.min(FIGHTER_EVADE_MAX_DURATION, turnNeeded / boostedRateRad + 0.35);
           break;
@@ -337,37 +350,55 @@ function setup(ctx: SceneContext): SceneInstance {
       active.evadeTimer -= delta;
       _desiredDir.copy(active.evadeDir);
     } else {
+      // Phase hysteresis: break off into an extend when the attack run gets
+      // too close; only re-commit to a joust once we've opened enough range
+      // to turn around without stalling next to the player.
+      if (active.phase === "attack" && dist < FIGHTER_BREAK_RANGE) {
+        active.phase = "extend";
+      } else if (active.phase === "extend" && dist > FIGHTER_REENGAGE_RANGE) {
+        active.phase = "attack";
+        // Fresh pass plane / slip side for the next attack run.
+        active.strafeSign = Math.random() < 0.5 ? 1 : -1;
+        active.orbitAzimuth = Math.random() * Math.PI * 2;
+        active.strafeTimer = THREE.MathUtils.lerp(1.2, 2.6, Math.random());
+      }
+
       active.strafeTimer -= delta;
       if (active.strafeTimer <= 0) {
         active.strafeSign = Math.random() < 0.5 ? 1 : -1;
         active.strafeTimer = THREE.MathUtils.lerp(1.2, 2.6, Math.random());
-        // Re-roll the orbit plane so successive orbits aren't all coplanar —
-        // this azimuth rolls the lead axis around the line to the player.
         active.orbitAzimuth = Math.random() * Math.PI * 2;
       }
-      if (dist < FIGHTER_MIN_RANGE) {
-        _desiredDir.copy(_toPlayerDir).multiplyScalar(-1); // too close: back straight off
-      } else if (dist > FIGHTER_MAX_RANGE) {
-        _desiredDir.copy(_toPlayerDir); // too far: close straight in
+
+      if (active.phase === "extend") {
+        // Still closing on this pass: keep flying forward (with a slip if
+        // we're aimed too dead-on) so we complete the pass instead of trying
+        // a 180° reverse while on top of the player. Once past, extend away.
+        const closing = _forward.dot(_toPlayerDir);
+        if (closing > 0.15) {
+          _desiredDir.copy(_forward);
+          if (closing > 0.92) {
+            // Near collision course — nudge onto a slip so the pass clears
+            // the player's hull rather than ramming through.
+            _right.crossVectors(_toPlayerDir, WORLD_Y);
+            if (_right.lengthSq() < 1e-6) _right.crossVectors(_toPlayerDir, WORLD_X);
+            _right.normalize();
+            _axis.crossVectors(_right, _toPlayerDir).normalize();
+            _axis.applyAxisAngle(_toPlayerDir, active.orbitAzimuth);
+            _desiredDir.addScaledVector(_axis, 0.45 * active.strafeSign).normalize();
+          }
+        } else {
+          _desiredDir.copy(_toPlayerDir).multiplyScalar(-1);
+        }
       } else {
-        // Comfortable range: orbit at a fixed lead angle off pure pursuit
-        // rather than a pure tangential strafe (which a vector-sum blend
-        // could never guarantee stays inside the nose-gun's firing cone,
-        // however the weights were tuned) — rotating toPlayerDir by a
-        // bounded angle guarantees the heading always stays within the
-        // alignment gate (~32°) while still circling, since the orbit
-        // itself keeps changing which way "toward the player" points.
-        //
-        // The lead axis is built from the engagement geometry (a local "up"
-        // perpendicular to toPlayerDir), NOT world Y: rotating around world Y
-        // barely moves toPlayerDir once the fight goes vertical, collapsing
-        // the orbit into pure pursuit. The azimuth roll makes it 3D.
+        // Attack run: close with a small lead so the nose stays inside the
+        // fire cone for the joust while successive passes aren't identical.
         _right.crossVectors(_toPlayerDir, WORLD_Y);
         if (_right.lengthSq() < 1e-6) _right.crossVectors(_toPlayerDir, WORLD_X);
         _right.normalize();
         _axis.crossVectors(_right, _toPlayerDir).normalize();
         _axis.applyAxisAngle(_toPlayerDir, active.orbitAzimuth);
-        const leadAngle = THREE.MathUtils.degToRad(22) * active.strafeSign;
+        const leadAngle = THREE.MathUtils.degToRad(FIGHTER_ATTACK_LEAD_DEG) * active.strafeSign;
         _desiredDir.copy(_toPlayerDir).applyAxisAngle(_axis, leadAngle);
       }
     }
@@ -417,12 +448,15 @@ function setup(ctx: SceneContext): SceneInstance {
     const turnedAngle = _prevForward.angleTo(_forward);
 
     // Thrust is always along the CURRENT nose direction, never the desired
-    // one — reversing course means actually turning around first. A craft
-    // that can't strafe has to be able to BRAKE when it's pointed the wrong
-    // way (otherwise it barrels through the player while trying to back off
-    // inside min range); the taxi floor keeps it from ever fully stalling.
+    // one — reversing course means actually turning around first. Brake hard
+    // when badly misaligned so an attack run doesn't skate sideways; during
+    // an extend, keep a higher floor so the post-pass turnaround still covers
+    // ground instead of taxiing in place.
     const dot = _forward.dot(_desiredDir);
-    const speedScale = dot >= 0 ? THREE.MathUtils.lerp(0.4, 1, dot) : THREE.MathUtils.lerp(0.4, 0.06, -dot);
+    let speedScale = dot >= 0 ? THREE.MathUtils.lerp(0.4, 1, dot) : THREE.MathUtils.lerp(0.4, 0.06, -dot);
+    if (active.phase === "extend" && active.evadeTimer <= 0) {
+      speedScale = Math.max(speedScale, 0.45);
+    }
     _targetVelocity.copy(_forward).multiplyScalar(active.maxSpeed * speedScale);
     active.velocity.lerp(_targetVelocity, 1 - Math.pow(0.001, delta));
     active.position.addScaledVector(active.velocity, delta);
@@ -674,6 +708,6 @@ function setup(ctx: SceneContext): SceneInstance {
 export const wedgeDuelScene: TestScene = {
   id: "wedge-duel",
   name: "Course: Wedge Duel",
-  description: "One-on-one dogfight against a conventional fighter — orientation-locked, banks into turns, nose-mounted guns.",
+  description: "One-on-one dogfight against a conventional fighter — jousting passes, orientation-locked, banks into turns, nose-mounted guns.",
   setup,
 };
