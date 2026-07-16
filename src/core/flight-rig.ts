@@ -78,6 +78,19 @@ function savePersistedParams(params: PersistedParams): void {
   }
 }
 
+// Per-frame scratch objects for FlightRig.update(), which runs every frame in
+// many scenes — reused in place (via .set()/.copy()/.setFromEuler()/etc.)
+// instead of allocating fresh objects, to avoid GC churn on phones. update() is
+// never re-entrant, so module-scope sharing is safe. Where two intermediate
+// values are alive at once within a single call, distinct scratch objects are
+// used (_quat + _quat2 in the gyro-trim slerp). Z_AXIS is a shared constant and
+// is never mutated.
+const _quat = new THREE.Quaternion();
+const _quat2 = new THREE.Quaternion();
+const _euler = new THREE.Euler();
+const _vec = new THREE.Vector3();
+const Z_AXIS = Object.freeze(new THREE.Vector3(0, 0, 1)) as THREE.Vector3;
+
 /**
  * The shared 6DOF touch-navigation rig originally built for the Space Sim
  * scene: dual floating joysticks (rate-control translate + look, with a
@@ -112,7 +125,12 @@ export class FlightRig {
   private readonly angularVelocity = { yaw: 0, pitch: 0 };
   private readonly gyroQuaternion = new THREE.Quaternion();
   private haveGyro = false;
+  // Null when there is no previous-frame gyro sample yet (null-ness is
+  // meaningful — see update/resetTouchState). When valid, it points at the
+  // persistent gyroTrimPrevStore below, which we .copy() into rather than
+  // reallocating a snapshot each frame.
   private gyroTrimPrev: THREE.Quaternion | null = null;
+  private readonly gyroTrimPrevStore = new THREE.Quaternion();
   private pendingRoll = 0;
 
   private readonly audio = new AudioClicker();
@@ -429,8 +447,8 @@ export class FlightRig {
           if (held < FLICK_TIME_MS && dist < FLICK_DIST_PX) {
             const posYaw = -THREE.MathUtils.clamp(this.lastLookDx / FLICK_DIST_PX, -1, 1) * FLICK_MAX_ANGLE;
             const posPitch = -THREE.MathUtils.clamp(this.lastLookDy / FLICK_DIST_PX, -1, 1) * FLICK_MAX_ANGLE;
-            const offset = new THREE.Quaternion().setFromEuler(new THREE.Euler(posPitch, posYaw, 0, "YXZ"));
-            this.quaternion.copy(this.lookBaseQuaternion).multiply(offset);
+            _quat.setFromEuler(_euler.set(posPitch, posYaw, 0, "YXZ"));
+            this.quaternion.copy(this.lookBaseQuaternion).multiply(_quat);
             this.angularVelocity.yaw = 0;
             this.angularVelocity.pitch = 0;
             handledByFlick = true;
@@ -458,10 +476,8 @@ export class FlightRig {
           this.angularVelocity.pitch = targetPitchRate;
         }
 
-        const lookDelta = new THREE.Quaternion().setFromEuler(
-          new THREE.Euler(this.angularVelocity.pitch * delta, this.angularVelocity.yaw * delta, 0, "YXZ"),
-        );
-        this.quaternion.multiply(lookDelta);
+        _quat.setFromEuler(_euler.set(this.angularVelocity.pitch * delta, this.angularVelocity.yaw * delta, 0, "YXZ"));
+        this.quaternion.multiply(_quat);
       }
 
       // Gyro fine-trim: adds the device's relative tilt since last frame as a
@@ -470,11 +486,11 @@ export class FlightRig {
       // the gyro-move scheme while still giving fine-aim assistance).
       if (params.gyroTrim && this.haveGyro) {
         if (this.gyroTrimPrev) {
-          const trimDelta = this.gyroTrimPrev.clone().invert().multiply(this.gyroQuaternion);
-          const scaled = new THREE.Quaternion().identity().slerp(trimDelta, params.gyroTrimStrength);
+          const trimDelta = _quat.copy(this.gyroTrimPrev).invert().multiply(this.gyroQuaternion);
+          const scaled = _quat2.identity().slerp(trimDelta, params.gyroTrimStrength);
           this.quaternion.multiply(scaled);
         }
-        this.gyroTrimPrev = this.gyroQuaternion.clone();
+        this.gyroTrimPrev = this.gyroTrimPrevStore.copy(this.gyroQuaternion);
       } else {
         this.gyroTrimPrev = null;
       }
@@ -487,19 +503,20 @@ export class FlightRig {
       // twisting motion, which runs out of comfortable wrist range fast.
       const rollRate = -this.rollSlider.value * lookRateRad;
       if (rollRate !== 0) {
-        const rollQuat = new THREE.Quaternion().setFromAxisAngle(new THREE.Vector3(0, 0, 1), rollRate * delta);
-        this.quaternion.multiply(rollQuat);
+        _quat.setFromAxisAngle(Z_AXIS, rollRate * delta);
+        this.quaternion.multiply(_quat);
       }
     } else if (this.pendingRoll !== 0) {
-      const rollQuat = new THREE.Quaternion().setFromAxisAngle(new THREE.Vector3(0, 0, 1), -this.pendingRoll);
-      this.quaternion.multiply(rollQuat);
+      _quat.setFromAxisAngle(Z_AXIS, -this.pendingRoll);
+      this.quaternion.multiply(_quat);
       this.pendingRoll = 0;
     }
 
     const verticalInput = params.auxInput === "sliders" ? this.verticalSlider.value : this.fingerVerticalInput;
     const thrust = -this.moveStick.value.y;
     const strafe = this.moveStick.value.x;
-    const targetVelocity = new THREE.Vector3(strafe, verticalInput, -thrust)
+    const targetVelocity = _vec
+      .set(strafe, verticalInput, -thrust)
       .multiplyScalar(params.maxSpeed)
       .applyQuaternion(this.quaternion);
 
