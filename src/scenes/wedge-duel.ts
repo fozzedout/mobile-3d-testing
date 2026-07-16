@@ -55,7 +55,7 @@ interface Fighter {
   maxSpeed: number;
   hp: number;
   fireCooldown: number;
-  strafeDir: THREE.Vector3;
+  strafeSign: number;
   strafeTimer: number;
   evadeDir: THREE.Vector3 | null;
   evadeTimer: number;
@@ -209,7 +209,7 @@ function setup(ctx: SceneContext): SceneInstance {
       maxSpeed: Math.min(FIGHTER_MAX_SPEED_CAP, FIGHTER_BASE_MAX_SPEED + kills * FIGHTER_SPEED_PER_KILL),
       hp: FIGHTER_HP,
       fireCooldown: THREE.MathUtils.lerp(0.4, 1.0, Math.random()),
-      strafeDir: new THREE.Vector3(1, 0, 0),
+      strafeSign: Math.random() < 0.5 ? 1 : -1,
       strafeTimer: 0,
       evadeDir: null,
       evadeTimer: 0,
@@ -261,21 +261,29 @@ function setup(ctx: SceneContext): SceneInstance {
     } else {
       active.strafeTimer -= delta;
       if (active.strafeTimer <= 0) {
-        const lateral = new THREE.Vector3().crossVectors(toPlayerDir, new THREE.Vector3(0, 1, 0));
-        if (lateral.lengthSq() < 1e-6) lateral.set(1, 0, 0);
-        lateral.normalize().multiplyScalar(Math.random() < 0.5 ? 1 : -1);
-        active.strafeDir = lateral;
+        active.strafeSign = Math.random() < 0.5 ? 1 : -1;
         active.strafeTimer = THREE.MathUtils.lerp(1.2, 2.6, Math.random());
       }
-      let radial = 0;
-      if (dist < FIGHTER_MIN_RANGE) radial = -1;
-      else if (dist > FIGHTER_MAX_RANGE) radial = 1;
-      const combo = toPlayerDir.clone().multiplyScalar(radial * 0.9).add(active.strafeDir.clone().multiplyScalar(0.8));
-      desiredDir = combo.lengthSq() > 1e-6 ? combo.normalize() : toPlayerDir;
+      if (dist < FIGHTER_MIN_RANGE) {
+        desiredDir = toPlayerDir.clone().multiplyScalar(-1); // too close: back straight off
+      } else if (dist > FIGHTER_MAX_RANGE) {
+        desiredDir = toPlayerDir.clone(); // too far: close straight in
+      } else {
+        // Comfortable range: orbit at a fixed lead angle off pure pursuit
+        // rather than a pure tangential strafe (which a vector-sum blend
+        // could never guarantee stays inside the nose-gun's firing cone,
+        // however the weights were tuned) — rotating toPlayerDir by a
+        // bounded angle guarantees the heading always stays within the
+        // alignment gate (~32°) while still circling, since the orbit
+        // itself keeps changing which way "toward the player" points.
+        const leadAngle = THREE.MathUtils.degToRad(22) * active.strafeSign;
+        desiredDir = toPlayerDir.clone().applyAxisAngle(new THREE.Vector3(0, 1, 0), leadAngle);
+      }
     }
 
     // Turn toward the desired heading at a bounded rate — this (not an
     // instant velocity flip) is what makes it read as a real craft.
+    const prevQuaternion = active.quaternion.clone();
     const prevForward = new THREE.Vector3(0, 0, -1).applyQuaternion(active.quaternion);
     const targetQuat = new THREE.Quaternion().setFromUnitVectors(new THREE.Vector3(0, 0, -1), desiredDir);
     const maxStep = THREE.MathUtils.degToRad(FIGHTER_TURN_RATE_DEG) * delta;
@@ -295,10 +303,14 @@ function setup(ctx: SceneContext): SceneInstance {
 
     // Purely cosmetic roll into the turn, proportional to how hard it's
     // actually turning this frame — makes the direction change legible at a
-    // glance instead of just a slowly reorienting nose.
+    // glance instead of just a slowly reorienting nose. Sign comes from the
+    // rotation actually just applied (not a separately-recomputed direction
+    // toward the ever-shifting desiredDir), which was flickering: near
+    // alignment a fresh cross product each frame flips sign on tiny noise
+    // even though no real turn was happening.
     const turnRateNow = delta > 0 ? turnedAngle / delta : 0;
-    const turnCross = new THREE.Vector3().crossVectors(forward, desiredDir);
-    const bankSign = turnCross.y > 0 ? -1 : turnCross.y < 0 ? 1 : 0;
+    const appliedRotation = prevQuaternion.clone().invert().multiply(active.quaternion);
+    const bankSign = Math.sign(appliedRotation.y) || 0;
     const bankFraction = THREE.MathUtils.clamp(turnRateNow / THREE.MathUtils.degToRad(FIGHTER_TURN_RATE_DEG), 0, 1);
     const bankAngle = bankFraction * THREE.MathUtils.degToRad(FIGHTER_MAX_BANK_DEG) * bankSign;
     const bankQuat = new THREE.Quaternion().setFromAxisAngle(new THREE.Vector3(0, 0, 1), bankAngle);
