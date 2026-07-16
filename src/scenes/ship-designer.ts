@@ -496,14 +496,17 @@ function setup(ctx: SceneContext): SceneInstance {
     m.z = z;
     positionModuleMesh(m.mesh, m);
   }
-  // Rotation yaws the footprint by swapping dx<->dz around the preserved anchor. The mesh
-  // just swaps to the matching cached geometry; icon texture is unaffected. If the rotated
-  // footprint collides or breaks a rule we DON'T block it — validation flags it red and
-  // the user can drag it somewhere valid.
-  function rotateModule(m: Module): void {
-    const ndx = m.dz;
-    m.dz = m.dx;
-    m.dx = ndx;
+  // Rotation reorients the footprint around the preserved anchor by swapping two of its
+  // dims: "yaw" (vertical axis) swaps dx<->dz, "pitch" (lateral axis) swaps dy<->dz — so an
+  // M block (1x1x2) can stand upright (1x2x1). The mesh just swaps to the matching cached
+  // geometry; icon texture is unaffected. If the rotated footprint collides or breaks a
+  // rule we DON'T block it — validation flags it red and the user drags it somewhere valid.
+  function rotateModule(m: Module, axis: "yaw" | "pitch"): void {
+    if (axis === "yaw") {
+      const n = m.dz; m.dz = m.dx; m.dx = n;
+    } else {
+      const n = m.dz; m.dz = m.dy; m.dy = n;
+    }
     m.mesh.geometry = moduleGeometryFor(m.dx, m.dy, m.dz);
     positionModuleMesh(m.mesh, m);
   }
@@ -699,6 +702,14 @@ function setup(ctx: SceneContext): SceneInstance {
     m.material.color.set("#ffffff");
     m.material.emissive.set(valid ? "#43f08a" : "#ff3b3b");
     m.material.emissiveIntensity = 0.9;
+    m.mesh.scale.setScalar(1.12);
+  }
+  // Unsnapped "carrying" tint: a dim blue self-glow, distinct from green (placeable) and
+  // red (colliding) — it just means the block is riding the finger in free space.
+  function applyFloatTint(m: Module): void {
+    m.material.color.set("#ffffff");
+    m.material.emissive.set("#4da3ff");
+    m.material.emissiveIntensity = 0.5;
     m.mesh.scale.setScalar(1.12);
   }
 
@@ -900,9 +911,9 @@ function setup(ctx: SceneContext): SceneInstance {
     select(null);
     onLayoutChanged();
   }
-  function rotateSelected(): void {
+  function rotateSelected(axis: "yaw" | "pitch"): void {
     if (!selected) return;
-    rotateModule(selected);
+    rotateModule(selected, axis);
     onLayoutChanged();
   }
 
@@ -974,6 +985,7 @@ function setup(ctx: SceneContext): SceneInstance {
   const ndc = new THREE.Vector2();
   const worldNormal = new THREE.Vector3();
   const hitPoint = new THREE.Vector3();
+  const scratchVec = new THREE.Vector3(); // reused for the floating-ghost ray point
   const dragTargets: THREE.Mesh[] = [];
 
   function raycastModules(clientX: number, clientY: number, exclude: Module | null): THREE.Intersection[] {
@@ -994,6 +1006,19 @@ function setup(ctx: SceneContext): SceneInstance {
     // face-attach; the per-type rule is deferred to post-drop validation).
     dg.valid = footprintFree(x, y, z, m.dx, m.dy, m.dz, m);
     applyDragTint(m, dg.valid);
+    m.mesh.visible = true;
+  }
+
+  // No structure face under the pointer → the ghost has no snap candidate. Float its mesh
+  // on the pointer ray at the camera-to-target distance so it visibly rides the finger,
+  // wearing the neutral "carrying" tint. Unsnapped release discards (palette) / snaps back
+  // (module), so we null the candidate here.
+  function floatDragGhost(dg: Drag): void {
+    const m = dg.module!;
+    dg.candidate = null;
+    raycaster.ray.at(camera.position.distanceTo(controls.target), scratchVec);
+    m.mesh.position.copy(scratchVec);
+    applyFloatTint(m);
     m.mesh.visible = true;
   }
 
@@ -1023,11 +1048,8 @@ function setup(ctx: SceneContext): SceneInstance {
     const hits = raycastModules(clientX, clientY, m);
     const hit = hits[0];
     if (!hit || !hit.face) {
-      // No block under the pointer → keep the last candidate; if none, park it.
-      if (dg.candidate === null) {
-        if (dg.isNew) m.mesh.visible = false;
-        else positionModuleMesh(m.mesh, m);
-      }
+      // No block under the pointer → the ghost floats free on the ray (unsnapped).
+      floatDragGhost(dg);
       return;
     }
     const hm = meshToModule.get(hit.object)!;
@@ -1061,6 +1083,7 @@ function setup(ctx: SceneContext): SceneInstance {
   function finishDrag(commit: boolean): void {
     const dg = drag;
     drag = null;
+    exitTrashMode(); // commit / snap-back / cancel all clear any trash styling
     if (!dg) return;
     const ok = commit && dg.candidate !== null && dg.valid;
     if (dg.isNew) {
@@ -1090,6 +1113,18 @@ function setup(ctx: SceneContext): SceneInstance {
     updateBars();
   }
 
+  // A live module drag released over the palette bar trashes the block — the same full
+  // teardown as the Remove button (deselect, restat, revalidate), plus a status message.
+  function removeDraggedModule(dg: Drag): void {
+    const m = dg.module;
+    if (!m) return;
+    const label = `${m.type} ${m.size}`;
+    removeModule(m);
+    select(null);
+    onLayoutChanged();
+    readout.status = `removed ${label}`;
+  }
+
   // pointerdown is captured at the DOCUMENT so it runs during the capturing phase — i.e.
   // BEFORE OrbitControls' own pointerdown listener on the canvas (which, being on the
   // target element, would otherwise fire first regardless of any capture flag). When the
@@ -1117,8 +1152,13 @@ function setup(ctx: SceneContext): SceneInstance {
       // <8px before release is a tap (selection only); >=8px promotes to a live drag.
       if (Math.hypot(e.clientX - drag.startX, e.clientY - drag.startY) < DRAG_PX) return;
       drag.moved = true;
+      enterTrashMode(); // module drag is now live → the palette becomes a trash target
     }
     updateDragPreview(drag, e.clientX, e.clientY);
+    // Stronger red while the pointer is actually over the bar (module drags only).
+    if (!drag.isNew && drag.moved) {
+      paletteBar.classList.toggle("ship-palette--trash-hot", pointerInPalette(e.clientX, e.clientY));
+    }
   }
   function endModuleDrag(e: PointerEvent): void {
     controls.enabled = true;
@@ -1126,7 +1166,23 @@ function setup(ctx: SceneContext): SceneInstance {
   }
   function onDocPointerUp(e: PointerEvent): void {
     if (drag && e.pointerId === drag.pointerId) {
-      if (!drag.isNew) endModuleDrag(e);
+      const dg = drag;
+      if (!dg.isNew) endModuleDrag(e);
+      // Dropped on the palette bar: a live module drag trashes the block; a palette-spawned
+      // ghost just discards quietly. Anything else takes the normal commit/snap-back path.
+      if (pointerInPalette(e.clientX, e.clientY)) {
+        if (!dg.isNew && dg.moved) {
+          drag = null;
+          exitTrashMode();
+          removeDraggedModule(dg);
+          updateBars();
+          return;
+        }
+        if (dg.isNew) {
+          finishDrag(false);
+          return;
+        }
+      }
       finishDrag(true);
       return;
     }
@@ -1178,7 +1234,26 @@ function setup(ctx: SceneContext): SceneInstance {
     refreshPaletteIcons();
   });
   paletteBar.appendChild(sizeBtn);
+  // Trash hint: shown (via .ship-palette--trash) only while a module drag is live, so the
+  // bar reads as a "drop to remove" target. An overlaid child div is cleaner than juggling
+  // ::after content, and it's a child of paletteBar so paletteBar.remove() disposes it too.
+  const trashHint = document.createElement("div");
+  trashHint.className = "ship-palette-trash-hint";
+  trashHint.textContent = "Drop here to remove";
+  paletteBar.appendChild(trashHint);
   document.body.appendChild(paletteBar);
+
+  // The palette bar doubles as a trash target during a module drag (see onDocPointerMove).
+  function pointerInPalette(clientX: number, clientY: number): boolean {
+    const r = paletteBar.getBoundingClientRect();
+    return clientX >= r.left && clientX <= r.right && clientY >= r.top && clientY <= r.bottom;
+  }
+  function enterTrashMode(): void {
+    paletteBar.classList.add("ship-palette--trash");
+  }
+  function exitTrashMode(): void {
+    paletteBar.classList.remove("ship-palette--trash", "ship-palette--trash-hot");
+  }
 
   function refreshPaletteIcons(): void {
     for (const { btn, type } of paletteButtons) btn.style.backgroundImage = `url(${iconDataURL(type, state.paletteSize)})`;
@@ -1196,17 +1271,20 @@ function setup(ctx: SceneContext): SceneInstance {
   const actionLabel = document.createElement("span");
   actionLabel.className = "ship-actions-label";
   actionBar.appendChild(actionLabel);
-  const mkActionBtn = (label: string, act: string, onClick: () => void): void => {
+  const mkActionBtn = (label: string, act: string, aria: string, onClick: () => void): void => {
     const b = document.createElement("button");
     b.className = "ship-act-btn";
     b.dataset.act = act;
     b.textContent = label;
+    b.setAttribute("aria-label", aria);
     b.addEventListener("click", onClick);
     actionBar.appendChild(b);
   };
-  mkActionBtn("⟳ Rotate", "rotate", rotateSelected);
-  mkActionBtn("⧉ Duplicate", "duplicate", duplicateSelected);
-  mkActionBtn("✕ Remove", "remove", removeSelected);
+  // Two rotation axes: yaw (vertical, swaps dx<->dz) and pitch (lateral, swaps dy<->dz).
+  mkActionBtn("⟳ Y", "rotate-y", "rotate around vertical axis", () => rotateSelected("yaw"));
+  mkActionBtn("⤴ X", "rotate-x", "rotate around lateral axis", () => rotateSelected("pitch"));
+  mkActionBtn("⧉ Duplicate", "duplicate", "duplicate module", duplicateSelected);
+  mkActionBtn("✕ Remove", "remove", "remove module", removeSelected);
   document.body.appendChild(actionBar);
 
   // Both bars hide in exterior (read-only) view; the action bar also hides with no selection.

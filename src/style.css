@@ -443,9 +443,11 @@ body {
   z-index: 26;
   display: flex;
   align-items: center;
-  gap: 8px;
+  /* Tightened from 8px/10px so four buttons (2 rotate + duplicate + remove) plus the
+     label still fit a 390px viewport without shrinking the >=44px touch targets. */
+  gap: 6px;
   max-width: calc(100vw - 16px);
-  padding: 8px 10px;
+  padding: 8px;
   background: rgba(20, 22, 28, 0.9);
   border: 1px solid #2b2f3a;
   border-radius: 12px;
@@ -470,9 +472,9 @@ body {
 
 .ship-act-btn {
   flex: none;
-  min-width: 48px;
+  min-width: 44px;
   min-height: 48px;
-  padding: 0 10px;
+  padding: 0 8px;
   border: 1px solid #2b2f3a;
   border-radius: 8px;
   background: #1a1d24;
@@ -483,6 +485,48 @@ body {
 
 .ship-act-btn:active {
   background: #2b2f3a;
+}
+
+/* ---- palette-as-trash target (active only during a module drag) ------------------- */
+/* The hint overlays the bar via position:absolute; the base .ship-palette is already
+   position:fixed, so it's the positioning context. */
+.ship-palette--trash {
+  border-color: #ff5d7a;
+}
+
+/* Dim the type/size buttons so the trash affordance reads over them. */
+.ship-palette--trash .ship-pal-btn,
+.ship-palette--trash .ship-pal-size {
+  opacity: 0.35;
+}
+
+/* Stronger red while the pointer is actually inside the bar. */
+.ship-palette--trash-hot {
+  border-color: #ff3b3b;
+  background: rgba(60, 20, 26, 0.92);
+}
+
+/* Centered "Drop here to remove" overlay — hidden until the bar is in trash mode. */
+.ship-palette-trash-hint {
+  position: absolute;
+  inset: 0;
+  display: none;
+  align-items: center;
+  justify-content: center;
+  border-radius: 12px;
+  color: #ff9db0;
+  font-size: 14px;
+  font-weight: 700;
+  letter-spacing: 0.02em;
+  pointer-events: none;
+}
+
+.ship-palette--trash .ship-palette-trash-hint {
+  display: flex;
+}
+
+.ship-palette--trash-hot .ship-palette-trash-hint {
+  color: #ffd0d8;
 }
 
 /* Toggled by the scene to hide a bar (exterior view / no selection). Author-level
