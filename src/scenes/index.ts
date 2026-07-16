@@ -82,4 +82,10 @@ export const sceneRegistry: SceneMeta[] = [
     description: "One-on-one dogfight against a conventional fighter — orientation-locked, banks into turns, nose-mounted guns.",
     load: () => import("./wedge-duel.ts").then((m) => m.wedgeDuelScene),
   },
+  {
+    id: "ship-designer",
+    name: "Ship Designer (Modular)",
+    description: "Assemble reactors, engines, weapons and cargo on a 3D grid — hull stretches to fit, stats update live.",
+    load: () => import("./ship-designer.ts").then((m) => m.shipDesignerScene),
+  },
 ];
