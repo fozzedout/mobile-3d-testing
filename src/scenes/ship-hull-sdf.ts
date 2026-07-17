@@ -5,17 +5,23 @@ import { edgeTable as edgeTableRaw, triTable as triTableRaw } from "three/exampl
 const edgeTable = edgeTableRaw as unknown as Int32Array;
 const triTable = triTableRaw as unknown as Int32Array;
 
-/** Structure / module SDF primitives in world space (axis-aligned AABB of half-extents). */
-export type HullPrimitive =
-  | { kind: "box"; cx: number; cy: number; cz: number; hx: number; hy: number; hz: number; radius: number }
-  /** Cone: tip at local -Z, elliptical base at +Z. */
-  | { kind: "cone"; cx: number; cy: number; cz: number; hx: number; hy: number; hz: number }
-  /** Wedge: triangular prism, ridge along Z, base on -Y (roof ramp). */
-  | { kind: "wedge"; cx: number; cy: number; cz: number; hx: number; hy: number; hz: number }
-  /** Dome: full ellipsoid inscribed in the AABB. */
-  | { kind: "dome"; cx: number; cy: number; cz: number; hx: number; hy: number; hz: number }
-  /** Semi-dome: upper (+Y) hemisphere / half-ellipsoid, flat on -Y. */
-  | { kind: "semi"; cx: number; cy: number; cz: number; hx: number; hy: number; hz: number };
+/** Structure / module SDF primitives. Optional quaternion orients local → world. */
+export type HullPrimitive = {
+  kind: "box" | "cone" | "wedge" | "dome" | "semi";
+  cx: number;
+  cy: number;
+  cz: number;
+  hx: number;
+  hy: number;
+  hz: number;
+  /** Box corner roundness (box only). */
+  radius?: number;
+  /** Unit quaternion (local → world). Identity if omitted. */
+  qx?: number;
+  qy?: number;
+  qz?: number;
+  qw?: number;
+};
 
 function sdRoundBox(
   px: number, py: number, pz: number,
@@ -36,21 +42,18 @@ function sdEllipsoid(px: number, py: number, pz: number, hx: number, hy: number,
   return k0 === 0 ? Math.min(hx, hy, hz) * -1 : k0 * (k0 - 1) / k1;
 }
 
-/** Cone tip at z=-hz, elliptical base radii (hx,hy) at z=+hz. */
+/** Cone tip at y=+hy, elliptical base radii (hx,hz) at y=-hy — matches THREE.ConeGeometry. */
 function sdCone(px: number, py: number, pz: number, hx: number, hy: number, hz: number): number {
-  const t = (pz + hz) / Math.max(2 * hz, 1e-6); // 0 at tip, 1 at base
-  if (t <= 0) return Math.hypot(px, py, pz + hz); // beyond tip
+  const t = (hy - py) / Math.max(2 * hy, 1e-6); // 0 at tip, 1 at base
+  if (t <= 0) return Math.hypot(px, pz, py - hy); // beyond tip
   const rx = Math.max(1e-4, hx * Math.min(t, 1));
-  const ry = Math.max(1e-4, hy * Math.min(t, 1));
-  const radial = Math.hypot(px / rx, py / ry) - 1;
+  const rz = Math.max(1e-4, hz * Math.min(t, 1));
+  const radial = Math.hypot(px / rx, pz / rz) - 1;
   if (t > 1) {
-    // past base: distance to base disk / sides
-    const outside = Math.hypot(Math.max(radial, 0) * Math.min(rx, ry), pz - hz);
-    return radial > 0 ? outside : pz - hz;
+    const outside = Math.hypot(Math.max(radial, 0) * Math.min(rx, rz), -hy - py);
+    return radial > 0 ? outside : -hy - py;
   }
-  // Inside the Z slab: cylindrical-ish distance to the tapering wall, plus slight end bias.
-  const wall = radial * Math.min(rx, ry);
-  return wall;
+  return radial * Math.min(rx, rz);
 }
 
 /** Triangular prism: base on y=-hy, ridge along z at y=+hy, x=0. */
@@ -105,13 +108,50 @@ function sdSemiDome(px: number, py: number, pz: number, hx: number, hy: number, 
   return Math.max(dEll, dCut);
 }
 
+function quatConjugateApply(
+  px: number, py: number, pz: number,
+  qx: number, qy: number, qz: number, qw: number,
+): [number, number, number] {
+  // Apply q* (conjugate) to vector — world → local for unit quaternions.
+  const ix = -qx, iy = -qy, iz = -qz, iw = qw;
+  const tx = 2 * (iy * pz - iz * py);
+  const ty = 2 * (iz * px - ix * pz);
+  const tz = 2 * (ix * py - iy * px);
+  return [
+    px + iw * tx + (iy * tz - iz * ty),
+    py + iw * ty + (iz * tx - ix * tz),
+    pz + iw * tz + (ix * ty - iy * tx),
+  ];
+}
+
+function quatApply(
+  px: number, py: number, pz: number,
+  qx: number, qy: number, qz: number, qw: number,
+): [number, number, number] {
+  const tx = 2 * (qy * pz - qz * py);
+  const ty = 2 * (qz * px - qx * pz);
+  const tz = 2 * (qx * py - qy * px);
+  return [
+    px + qw * tx + (qy * tz - qz * ty),
+    py + qw * ty + (qz * tx - qx * tz),
+    pz + qw * tz + (qx * ty - qy * tx),
+  ];
+}
+
 function evalPrimitive(x: number, y: number, z: number, p: HullPrimitive): number {
-  const px = x - p.cx;
-  const py = y - p.cy;
-  const pz = z - p.cz;
+  let px = x - p.cx;
+  let py = y - p.cy;
+  let pz = z - p.cz;
+  const qw = p.qw ?? 1;
+  const qx = p.qx ?? 0;
+  const qy = p.qy ?? 0;
+  const qz = p.qz ?? 0;
+  if (qx !== 0 || qy !== 0 || qz !== 0 || qw !== 1) {
+    [px, py, pz] = quatConjugateApply(px, py, pz, qx, qy, qz, qw);
+  }
   switch (p.kind) {
     case "box":
-      return sdRoundBox(px, py, pz, p.hx, p.hy, p.hz, p.radius);
+      return sdRoundBox(px, py, pz, p.hx, p.hy, p.hz, p.radius ?? 0);
     case "cone":
       return sdCone(px, py, pz, p.hx, p.hy, p.hz);
     case "wedge":
@@ -124,15 +164,36 @@ function evalPrimitive(x: number, y: number, z: number, p: HullPrimitive): numbe
 }
 
 function primitiveBounds(p: HullPrimitive): { minX: number; maxX: number; minY: number; maxY: number; minZ: number; maxZ: number } {
-  const pad = p.kind === "box" ? p.radius : 0;
-  return {
-    minX: p.cx - p.hx - pad,
-    maxX: p.cx + p.hx + pad,
-    minY: p.cy - p.hy - pad,
-    maxY: p.cy + p.hy + pad,
-    minZ: p.cz - p.hz - pad,
-    maxZ: p.cz + p.hz + pad,
-  };
+  const pad = p.kind === "box" ? (p.radius ?? 0) : 0;
+  const qw = p.qw ?? 1;
+  const qx = p.qx ?? 0;
+  const qy = p.qy ?? 0;
+  const qz = p.qz ?? 0;
+  const oriented = qx !== 0 || qy !== 0 || qz !== 0 || qw !== 1;
+  if (!oriented) {
+    return {
+      minX: p.cx - p.hx - pad,
+      maxX: p.cx + p.hx + pad,
+      minY: p.cy - p.hy - pad,
+      maxY: p.cy + p.hy + pad,
+      minZ: p.cz - p.hz - pad,
+      maxZ: p.cz + p.hz + pad,
+    };
+  }
+  // Oriented AABB from the 8 local corners.
+  let minX = Infinity, minY = Infinity, minZ = Infinity;
+  let maxX = -Infinity, maxY = -Infinity, maxZ = -Infinity;
+  for (const sx of [-1, 1]) {
+    for (const sy of [-1, 1]) {
+      for (const sz of [-1, 1]) {
+        const [wx, wy, wz] = quatApply(sx * (p.hx + pad), sy * (p.hy + pad), sz * (p.hz + pad), qx, qy, qz, qw);
+        minX = Math.min(minX, p.cx + wx); maxX = Math.max(maxX, p.cx + wx);
+        minY = Math.min(minY, p.cy + wy); maxY = Math.max(maxY, p.cy + wy);
+        minZ = Math.min(minZ, p.cz + wz); maxZ = Math.max(maxZ, p.cz + wz);
+      }
+    }
+  }
+  return { minX, maxX, minY, maxY, minZ, maxZ };
 }
 
 /** Polynomial smooth-min — k is the fillet / "sleekness" width. */
@@ -275,5 +336,5 @@ export function buildSdfHullGeometry(
   return geo;
 }
 
-/** @deprecated Use HullPrimitive — kept as alias for box-only call sites. */
-export type HullBox = Extract<HullPrimitive, { kind: "box" }>;
+/** @deprecated Use HullPrimitive. */
+export type HullBox = HullPrimitive;

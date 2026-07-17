@@ -355,7 +355,8 @@ function makeStructureShapeIcon(shape: StructureShape): THREE.CanvasTexture {
   return tex;
 }
 
-/** Preview / internal mesh for a structure fairing, sized to the footprint. */
+/** Preview / internal mesh for a structure fairing, sized to the footprint (local space).
+ *  Orientation is applied via mesh.quaternion — cone tip is +Y here, then rotated to -Z. */
 function buildStructureGeometry(shape: StructureShape, dx: number, dy: number, dz: number): THREE.BufferGeometry {
   const sx = dx * CELL * 0.86;
   const sy = dy * CELL * 0.86;
@@ -363,11 +364,9 @@ function buildStructureGeometry(shape: StructureShape, dx: number, dy: number, d
   switch (shape) {
     case "block":
       return new THREE.BoxGeometry(sx, sy, sz);
-    case "cone": {
-      const g = new THREE.ConeGeometry(Math.max(sx, sy) * 0.5, sz, 20);
-      g.rotateX(-Math.PI / 2); // tip toward -Z (nose)
-      return g;
-    }
+    case "cone":
+      // Tip +Y (Three default). createModule aims it -Z via mesh.rotation.
+      return new THREE.ConeGeometry(Math.max(sx, sy) * 0.5, sz, 20);
     case "wedge": {
       const sh = new THREE.Shape();
       sh.moveTo(-sx / 2, -sy / 2);
@@ -384,13 +383,18 @@ function buildStructureGeometry(shape: StructureShape, dx: number, dy: number, d
       return g;
     }
     case "semi": {
-      // Upper hemisphere in +Y, flat on the equator.
       const g = new THREE.SphereGeometry(1, 22, 12, 0, Math.PI * 2, 0, Math.PI / 2);
       g.scale(sx / 2, sy, sz / 2);
-      g.translate(0, -sy / 2, 0); // sit flat on the cell floor
+      g.translate(0, -sy / 2, 0);
       return g;
     }
   }
+}
+
+/** Default facing for a newly placed structure fairing. */
+function aimStructureMesh(mesh: THREE.Mesh, shape: StructureShape): void {
+  mesh.rotation.set(0, 0, 0);
+  if (shape === "cone") mesh.rotation.x = -Math.PI / 2; // tip toward -Z (nose)
 }
 
 function setup(ctx: SceneContext): SceneInstance {
@@ -655,6 +659,7 @@ function setup(ctx: SceneContext): SceneInstance {
       ? structureGeometryFor(resolvedShape, dx, dy, dz)
       : moduleGeometryFor(dx, dy, dz);
     const mesh = new THREE.Mesh(geo, material);
+    if (type === "structure") aimStructureMesh(mesh, resolvedShape);
     const m: Module = { type, size, shape: resolvedShape, x, y, z, dx, dy, dz, mesh, material };
     positionModuleMesh(mesh, m);
     return m;
@@ -689,16 +694,16 @@ function setup(ctx: SceneContext): SceneInstance {
     m.z = z;
     positionModuleMesh(m.mesh, m);
   }
-  // Rotation reorients the footprint around the preserved anchor by swapping two of its
-  // dims: "yaw" (vertical axis) swaps dx<->dz, "pitch" (lateral axis) swaps dy<->dz — so an
-  // M block (1x1x2) can stand upright (1x2x1). The mesh just swaps to the matching cached
-  // geometry; icon texture is unaffected. If the rotated footprint collides or breaks a
-  // rule we DON'T block it — validation flags it red and the user drags it somewhere valid.
+  // Rotation reorients the footprint by swapping dims (occupancy), and for structure
+  // fairings also spins the mesh — S/XL cubes are footprint no-ops, but cones/wedges
+  // must still turn. World-axis steps avoid Euler gimbal with accumulated yaw+pitch.
   function rotateModule(m: Module, axis: "yaw" | "pitch"): void {
     if (axis === "yaw") {
       const n = m.dz; m.dz = m.dx; m.dx = n;
+      if (m.type === "structure") m.mesh.rotateOnWorldAxis(_yawAxis, Math.PI / 2);
     } else {
       const n = m.dz; m.dz = m.dy; m.dy = n;
+      if (m.type === "structure") m.mesh.rotateOnWorldAxis(_pitchAxis, Math.PI / 2);
     }
     m.mesh.geometry = m.type === "structure"
       ? structureGeometryFor(m.shape, m.dx, m.dy, m.dz)
@@ -947,6 +952,10 @@ function setup(ctx: SceneContext): SceneInstance {
     else buildBoxHull();
   }
 
+  // World-axis unit vectors for structure fairing snaps (also used when bridging SDF).
+  const _yawAxis = new THREE.Vector3(0, 1, 0);
+  const _pitchAxis = new THREE.Vector3(1, 0, 0);
+
   // SDF smooth-union of module primitives → marching cubes. Structure shapes (cone,
   // wedge, dome, …) become matching SDF prims so fairings sculpt the skinned shell.
   function buildSkinnedHull(): void {
@@ -958,16 +967,22 @@ function setup(ctx: SceneContext): SceneInstance {
       const hx = (m.dx * CELL) / 2 + skin;
       const hy = (m.dy * CELL) / 2 + skin;
       const hz = (m.dz * CELL) / 2 + skin;
+      const q = m.mesh.quaternion;
+      const orient = m.type === "structure"
+        ? { qx: q.x, qy: q.y, qz: q.z, qw: q.w }
+        : {};
+      // Cone half-extents: mesh ConeGeometry height is along local Y (= footprint Z after
+      // aimStructureMesh tips it -Z). Pass height on hy to match SDF tip +Y.
       if (m.type !== "structure" || m.shape === "block") {
-        prims.push({ kind: "box", cx: c.x, cy: c.y, cz: c.z, hx, hy, hz, radius: round });
+        prims.push({ kind: "box", cx: c.x, cy: c.y, cz: c.z, hx, hy, hz, radius: round, ...orient });
       } else if (m.shape === "cone") {
-        prims.push({ kind: "cone", cx: c.x, cy: c.y, cz: c.z, hx, hy, hz });
+        prims.push({ kind: "cone", cx: c.x, cy: c.y, cz: c.z, hx, hy: hz, hz: hy, ...orient });
       } else if (m.shape === "wedge") {
-        prims.push({ kind: "wedge", cx: c.x, cy: c.y, cz: c.z, hx, hy, hz });
+        prims.push({ kind: "wedge", cx: c.x, cy: c.y, cz: c.z, hx, hy, hz, ...orient });
       } else if (m.shape === "dome") {
-        prims.push({ kind: "dome", cx: c.x, cy: c.y, cz: c.z, hx, hy, hz });
+        prims.push({ kind: "dome", cx: c.x, cy: c.y, cz: c.z, hx, hy, hz, ...orient });
       } else {
-        prims.push({ kind: "semi", cx: c.x, cy: c.y, cz: c.z, hx, hy, hz });
+        prims.push({ kind: "semi", cx: c.x, cy: c.y, cz: c.z, hx, hy, hz, ...orient });
       }
     }
     const geo = buildSdfHullGeometry(prims, {
@@ -1234,13 +1249,15 @@ function setup(ctx: SceneContext): SceneInstance {
       return;
     }
     const copy = addModuleAt(selected.type, selected.size, dest.x, dest.y, dest.z, selected.shape);
-    // A duplicate of a rotated module should match its orientation.
-    if (copy.dx !== selected.dx || copy.dz !== selected.dz) {
-      copy.dx = selected.dx;
-      copy.dz = selected.dz;
-      copy.mesh.geometry = moduleGeometryFor(copy.dx, copy.dy, copy.dz);
-      positionModuleMesh(copy.mesh, copy);
-    }
+    // A duplicate of a rotated module should match its orientation + footprint.
+    copy.dx = selected.dx;
+    copy.dy = selected.dy;
+    copy.dz = selected.dz;
+    copy.mesh.geometry = copy.type === "structure"
+      ? structureGeometryFor(copy.shape, copy.dx, copy.dy, copy.dz)
+      : moduleGeometryFor(copy.dx, copy.dy, copy.dz);
+    copy.mesh.quaternion.copy(selected.mesh.quaternion);
+    positionModuleMesh(copy.mesh, copy);
     select(copy);
     onLayoutChanged();
   }
