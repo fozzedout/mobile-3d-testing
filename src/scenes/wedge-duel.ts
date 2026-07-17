@@ -38,12 +38,15 @@ const FIGHTER_MAX_BANK_DEG = 42; // purely cosmetic roll into turns, doesn't aff
 const FIGHTER_BREAK_RANGE = 55;
 const FIGHTER_REENGAGE_RANGE = 210;
 const FIGHTER_FIRE_RANGE = 240;
-// Guns are nose-mounted — it has to actually be pointed close to the player
-// to fire, unlike the saucer's omnidirectional turret.
-const FIGHTER_FIRE_ALIGNMENT_MIN = 0.85;
-// Small lead off pure pursuit during an attack run so successive passes aren't
-// perfectly head-on rails (still well inside the fire-alignment cone).
-const FIGHTER_ATTACK_LEAD_DEG = 10;
+// Guns are nose-mounted — fire only when the nose is truly on the
+// intercept, not a wide cone (0.85 ≈ 32° used to "lock" while flying past).
+const FIGHTER_FIRE_ALIGNMENT_MIN = 0.98; // ~11°
+// At long range the player's angular size is tiny; demand a tighter lock
+// beyond this distance so distant joust shots aren't wasted.
+const FIGHTER_FIRE_TIGHT_RANGE = 120;
+const FIGHTER_FIRE_ALIGNMENT_TIGHT = 0.995; // ~5.7°
+// Bolt spray — kept small; at 200u even a few degrees is a clean miss.
+const FIGHTER_AIM_INACCURACY_DEG = 1.5;
 const FIGHTER_EVADE_LOOKAHEAD = 0.7;
 const FIGHTER_EVADE_RADIUS = 20;
 // While evading, the turn rate is boosted so the dodge reads as a distinct
@@ -54,7 +57,6 @@ const FIGHTER_FIRE_COOLDOWN_MIN_BASE = 1.0;
 const FIGHTER_FIRE_COOLDOWN_MAX_BASE = 1.9;
 const FIGHTER_FIRE_COOLDOWN_SHRINK_PER_KILL = 0.05;
 const FIGHTER_FIRE_COOLDOWN_FLOOR = 0.6;
-const FIGHTER_AIM_INACCURACY_DEG = 9;
 const FIGHTER_LASER_SPEED = 150;
 // Lifetime sized so bolts from FIRE_RANGE still reach (240 / 150 ≈ 1.6s).
 const FIGHTER_LASER_LIFETIME = 1.8;
@@ -76,7 +78,7 @@ interface Fighter {
   phase: "attack" | "extend";
   strafeSign: number;
   strafeTimer: number;
-  /** Roll of the pass-plane around the line to the player (attack lead axis). */
+  /** Roll of the pass-plane around the line to the player (extend slip axis). */
   orbitAzimuth: number;
   evadeDir: THREE.Vector3;
   evadeTimer: number;
@@ -108,6 +110,7 @@ const _rel = new THREE.Vector3();
 const _closestPoint = new THREE.Vector3();
 const _lateral = new THREE.Vector3();
 const _desiredDir = new THREE.Vector3();
+const _intercept = new THREE.Vector3();
 const _forward = new THREE.Vector3();
 const _prevForward = new THREE.Vector3();
 const _right = new THREE.Vector3();
@@ -392,15 +395,14 @@ function setup(ctx: SceneContext): SceneInstance {
           _desiredDir.copy(_toPlayerDir).multiplyScalar(-1);
         }
       } else {
-        // Attack run: close with a small lead so the nose stays inside the
-        // fire cone for the joust while successive passes aren't identical.
-        _right.crossVectors(_toPlayerDir, WORLD_Y);
-        if (_right.lengthSq() < 1e-6) _right.crossVectors(_toPlayerDir, WORLD_X);
-        _right.normalize();
-        _axis.crossVectors(_right, _toPlayerDir).normalize();
-        _axis.applyAxisAngle(_toPlayerDir, active.orbitAzimuth);
-        const leadAngle = THREE.MathUtils.degToRad(FIGHTER_ATTACK_LEAD_DEG) * active.strafeSign;
-        _desiredDir.copy(_toPlayerDir).applyAxisAngle(_axis, leadAngle);
+        // Attack run: point the nose at a laser-speed intercept of the
+        // player so bolts down the nose actually arrive where they'll be —
+        // not a fixed lead angle off pure pursuit (that systematically missed
+        // once joust range got long).
+        const flightTime = dist / FIGHTER_LASER_SPEED;
+        _intercept.copy(rig.position).addScaledVector(rig.velocity, flightTime).sub(active.position);
+        if (_intercept.lengthSq() > 1e-8) _desiredDir.copy(_intercept).normalize();
+        else _desiredDir.copy(_toPlayerDir);
       }
     }
 
@@ -494,7 +496,14 @@ function setup(ctx: SceneContext): SceneInstance {
     readout.rotJump = `${visualJumpDeg.toFixed(1)}°`;
 
     if (active.fireCooldown > 0) active.fireCooldown -= delta;
-    if (active.fireCooldown <= 0 && dist <= FIGHTER_FIRE_RANGE && active.evadeTimer <= 0 && _forward.dot(_toPlayerDir) >= FIGHTER_FIRE_ALIGNMENT_MIN) {
+    const alignMin = dist >= FIGHTER_FIRE_TIGHT_RANGE ? FIGHTER_FIRE_ALIGNMENT_TIGHT : FIGHTER_FIRE_ALIGNMENT_MIN;
+    // Align against the same intercept the nose is chasing (not raw toPlayer),
+    // otherwise a correct lead shot fails the gate while chasing a mover.
+    const flightTime = dist / FIGHTER_LASER_SPEED;
+    _intercept.copy(rig.position).addScaledVector(rig.velocity, flightTime).sub(active.position);
+    if (_intercept.lengthSq() > 1e-8) _intercept.normalize();
+    else _intercept.copy(_toPlayerDir);
+    if (active.fireCooldown <= 0 && dist <= FIGHTER_FIRE_RANGE && active.evadeTimer <= 0 && _forward.dot(_intercept) >= alignMin) {
       fireEnemyLaser(active);
       const minCd = Math.max(FIGHTER_FIRE_COOLDOWN_FLOOR, FIGHTER_FIRE_COOLDOWN_MIN_BASE - kills * FIGHTER_FIRE_COOLDOWN_SHRINK_PER_KILL);
       const maxCd = Math.max(minCd + 0.2, FIGHTER_FIRE_COOLDOWN_MAX_BASE - kills * FIGHTER_FIRE_COOLDOWN_SHRINK_PER_KILL);
