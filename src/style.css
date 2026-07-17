@@ -409,6 +409,8 @@ body {
   pointer-events: auto;
   /* The palette buttons initiate a drag — no browser scroll/zoom should steal it. */
   touch-action: none;
+  overflow-x: auto;
+  -webkit-overflow-scrolling: touch;
 }
 
 .ship-pal-btn {

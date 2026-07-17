@@ -4,11 +4,12 @@ import type { SceneContext, SceneInstance, TestScene } from "./types.ts";
 // One grid cell is 4 world units on a side. Space is an UNBOUNDED integer lattice:
 // cell (x,y,z) sits at world (x*CELL, y*CELL, z*CELL) and coords may go negative. There
 // are no w×h×d walls anymore — a design grows by attaching one block to the face of
-// another (see the drag flow), so the only structure is the modules themselves.
+// another (see the drag flow). Functional modules plus optional structure fairings
+// are the only occupancy; the exterior shell is generated from that occupancy.
 // +z is the REAR of the ship (engines exhaust that way); -z is the nose.
 const CELL = 4;
 
-type ModuleType = "reactor" | "engine" | "fuel" | "weapon" | "shield" | "cargo" | "crew";
+type ModuleType = "reactor" | "engine" | "fuel" | "weapon" | "shield" | "cargo" | "crew" | "structure";
 // Set-piece module sizes. A module also carries a LIVE footprint (dx,dy,dz); ROTATION
 // yaws it by swapping dx<->dz (dy is untouched — yaw only in v2). SIZE_DIMS is just the
 // unrotated default. S and XL are cubes, so their rotation is a visual no-op (fine).
@@ -18,7 +19,7 @@ type ViewMode = "internal" | "exterior" | "performance";
 type PrefabName = "fighter" | "trader";
 type HullStyle = "plated" | "box";
 
-const MODULE_TYPES: ModuleType[] = ["reactor", "engine", "fuel", "weapon", "shield", "cargo", "crew"];
+const MODULE_TYPES: ModuleType[] = ["reactor", "engine", "fuel", "weapon", "shield", "cargo", "crew", "structure"];
 const MODULE_SIZES: ModuleSize[] = ["S", "M", "L", "XL"];
 
 // Footprint dims (dx, dy, dz) in cells for each size. dx = width (x), dy = height (y),
@@ -60,6 +61,9 @@ const SPECS: Record<ModuleType, ModuleSpec> = {
   shield: { mass: 5, power: -3, heat: 0, thrust: 0, fuelBurn: 0, fuelCap: 0, dps: 0, shieldHP: 40, cargoCap: 0, color: "#4da3ff" },
   cargo: { mass: 7, power: 0, heat: 0, thrust: 0, fuelBurn: 0, fuelCap: 0, dps: 0, shieldHP: 0, cargoCap: 20, color: "#b08de0" },
   crew: { mass: 3, power: -1, heat: 0, thrust: 0, fuelBurn: 0, fuelCap: 0, dps: 0, shieldHP: 0, cargoCap: 0, color: "#e8eef8" },
+  // Fairing / filler: light dead mass only. Pads the exterior envelope so the shell can
+  // taper or fill gaps without buying another reactor, cargo bay, etc.
+  structure: { mass: 1, power: 0, heat: 0, thrust: 0, fuelBurn: 0, fuelCap: 0, dps: 0, shieldHP: 0, cargoCap: 0, color: "#6a7388" },
 };
 
 interface Cell {
@@ -240,6 +244,15 @@ function drawGlyph(g: CanvasRenderingContext2D, type: ModuleType): void {
       g.stroke();
       break;
     }
+    case "structure": {
+      // Fairing brace: outer frame with a diagonal strut (shape-only hull padding).
+      g.strokeRect(30, 30, 68, 68);
+      g.beginPath();
+      g.moveTo(30, 98); g.lineTo(98, 30);
+      g.moveTo(42, 42); g.lineTo(86, 86);
+      g.stroke();
+      break;
+    }
   }
 }
 function makeIconTexture(type: ModuleType, size: ModuleSize): THREE.CanvasTexture {
@@ -309,7 +322,7 @@ function setup(ctx: SceneContext): SceneInstance {
     return g;
   }
 
-  // 7 types x 4 sizes = 28 icon textures, generated once and disposed at teardown.
+  // 8 types x 4 sizes = 32 icon textures, generated once and disposed at teardown.
   const iconTextures = new Map<string, THREE.CanvasTexture>();
   const iconKey = (type: ModuleType, size: ModuleSize): string => `${type}:${size}`;
   for (const type of MODULE_TYPES) {
@@ -321,7 +334,7 @@ function setup(ctx: SceneContext): SceneInstance {
   const iconDataURL = (type: ModuleType, size: ModuleSize): string =>
     (iconTextures.get(iconKey(type, size))!.image as HTMLCanvasElement).toDataURL();
 
-  const hullMaterial = new THREE.MeshStandardMaterial({ color: "#5a6b8c", flatShading: true, metalness: 0.2, roughness: 0.7 });
+  const hullMaterial = new THREE.MeshStandardMaterial({ color: "#5a6b8c", metalness: 0.35, roughness: 0.45 });
   const nozzleMaterial = new THREE.MeshStandardMaterial({ color: "#2b2f38", metalness: 0.5, roughness: 0.5 });
 
   const moduleGroup = new THREE.Group();
@@ -715,8 +728,8 @@ function setup(ctx: SceneContext): SceneInstance {
 
   // ---- generated exterior hull ------------------------------------------------------
   function disposeHullMeshes(): void {
-    // The plated style shares one geometry across many meshes — collect into a
-    // set first so nothing gets double-disposed.
+    // Styles may share geometries across meshes (nozzles) — collect into a set first
+    // so nothing gets double-disposed.
     const geometries = new Set<THREE.BufferGeometry>();
     for (const child of hullGroup.children) {
       if (child instanceof THREE.Mesh) geometries.add(child.geometry);
@@ -749,33 +762,84 @@ function setup(ctx: SceneContext): SceneInstance {
     if (state.hullStyle === "plated") buildPlatedHull();
     else buildBoxHull();
   }
-  // Form-fitting "skin": one slightly-inflated armor plate per occupied CELL
-  // that has at least one exposed face, so the hull silhouette IS the module
-  // layout (an arrowhead fighter reads as an arrowhead, a cargo spine reads
-  // as a slab). Plates overlap their neighbors, which welds them into a
-  // chunky low-poly sheet-metal shell; overlapping coplanar faces share the
-  // same material and normal so they light identically — no shimmer.
+  // Form-fitting shell: for each Z-slice of occupied cells, take the cross-section
+  // AABB and merge consecutive identical slices into one inflated box. That covers
+  // the modules as a sleek fuselage rather than shrink-wrapping every cell. Structure
+  // fairings push those slice bounds out so you can taper, flare, or fill gaps without
+  // adding functional mass/power.
   function buildPlatedHull(): void {
-    const plateGeometry = new THREE.BoxGeometry(CELL * 1.3, CELL * 1.3, CELL * 1.3);
+    type Slice = { minX: number; maxX: number; minY: number; maxY: number };
+    const byZ = new Map<number, Slice>();
     for (const m of modules) {
       for (let ix = m.x; ix < m.x + m.dx; ix++) {
         for (let iy = m.y; iy < m.y + m.dy; iy++) {
           for (let iz = m.z; iz < m.z + m.dz; iz++) {
-            // Enclosed = all six cell-neighbors occupied (by any module, self included).
-            const enclosed =
-              occupantAt(ix + 1, iy, iz) && occupantAt(ix - 1, iy, iz) &&
-              occupantAt(ix, iy + 1, iz) && occupantAt(ix, iy - 1, iz) &&
-              occupantAt(ix, iy, iz + 1) && occupantAt(ix, iy, iz - 1);
-            if (enclosed) continue; // fully interior — its plate would never be seen
-            const plate = new THREE.Mesh(plateGeometry, hullMaterial);
-            plate.position.set(cellX(ix), cellY(iy), cellZ(iz));
-            hullGroup.add(plate);
+            const s = byZ.get(iz);
+            if (!s) byZ.set(iz, { minX: ix, maxX: ix, minY: iy, maxY: iy });
+            else {
+              s.minX = Math.min(s.minX, ix); s.maxX = Math.max(s.maxX, ix);
+              s.minY = Math.min(s.minY, iy); s.maxY = Math.max(s.maxY, iy);
+            }
           }
         }
       }
     }
-    // Rear plane of an engine = the world z of its rearmost cell layer + half a plate.
-    addEngineNozzles((m) => cellZ(m.z + m.dz - 1) + (CELL * 1.3) / 2);
+    const zs = [...byZ.keys()].sort((a, b) => a - b);
+    if (zs.length === 0) return;
+
+    const sameSlice = (a: Slice, b: Slice): boolean =>
+      a.minX === b.minX && a.maxX === b.maxX && a.minY === b.minY && a.maxY === b.maxY;
+
+    const margin = 0.55 * CELL;
+    let runStart = zs[0];
+    let runEnd = zs[0];
+    let runSlice = byZ.get(zs[0])!;
+
+    const flushRun = (): void => {
+      const sx = (runSlice.maxX - runSlice.minX + 1) * CELL + 2 * margin;
+      const sy = (runSlice.maxY - runSlice.minY + 1) * CELL + 2 * margin;
+      const sz = (runEnd - runStart + 1) * CELL + 2 * margin * 0.35;
+      const cx = cellX((runSlice.minX + runSlice.maxX) / 2);
+      const cy = cellY((runSlice.minY + runSlice.maxY) / 2);
+      const cz = cellZ((runStart + runEnd) / 2);
+      const body = new THREE.Mesh(new THREE.BoxGeometry(sx, sy, sz), hullMaterial);
+      body.position.set(cx, cy, cz);
+      hullGroup.add(body);
+    };
+
+    for (let i = 1; i < zs.length; i++) {
+      const z = zs[i];
+      const slice = byZ.get(z)!;
+      // Only merge contiguous z layers with identical cross-section bounds.
+      if (z === runEnd + 1 && sameSlice(slice, runSlice)) {
+        runEnd = z;
+        continue;
+      }
+      flushRun();
+      runStart = z;
+      runEnd = z;
+      runSlice = slice;
+    }
+    flushRun();
+
+    // Soft nose cap on the forward-most slice — reads as a cover, not a brick stack.
+    const noseSlice = byZ.get(zs[0])!;
+    const noseW = (noseSlice.maxX - noseSlice.minX + 1) * CELL + 2 * margin;
+    const noseH = (noseSlice.maxY - noseSlice.minY + 1) * CELL + 2 * margin;
+    const noseLen = 0.85 * CELL;
+    const nose = new THREE.Mesh(
+      new THREE.ConeGeometry(Math.max(noseW, noseH) * 0.38, noseLen, 4),
+      hullMaterial,
+    );
+    nose.rotation.x = -Math.PI / 2;
+    nose.position.set(
+      cellX((noseSlice.minX + noseSlice.maxX) / 2),
+      cellY((noseSlice.minY + noseSlice.maxY) / 2),
+      cellZ(zs[0]) - CELL / 2 - noseLen * 0.35,
+    );
+    hullGroup.add(nose);
+
+    addEngineNozzles((m) => cellZ(m.z + m.dz - 1) + CELL / 2 + margin);
   }
   // The original single-shell alternative, kept for comparison: an inflated
   // box over the installed modules' bounding volume with a cone nose.
@@ -1376,6 +1440,6 @@ function setup(ctx: SceneContext): SceneInstance {
 export const shipDesignerScene: TestScene = {
   id: "ship-designer",
   name: "Ship Designer (Modular)",
-  description: "Assemble reactors, engines, weapons and cargo by attaching blocks face-to-face — hull stretches to fit, stats update live.",
+  description: "Assemble reactors, engines, weapons, cargo and structure fairings — hull covers the layout, stats update live.",
   setup,
 };

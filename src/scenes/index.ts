@@ -85,7 +85,7 @@ export const sceneRegistry: SceneMeta[] = [
   {
     id: "ship-designer",
     name: "Ship Designer (Modular)",
-    description: "Assemble reactors, engines, weapons and cargo on a 3D grid — hull stretches to fit, stats update live.",
+    description: "Assemble reactors, engines, weapons, cargo and structure fairings — hull covers the layout, stats update live.",
     load: () => import("./ship-designer.ts").then((m) => m.shipDesignerScene),
   },
   {
