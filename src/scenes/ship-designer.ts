@@ -403,7 +403,16 @@ function setup(ctx: SceneContext): SceneInstance {
   const prevBackground = scene.background;
   const prevFog = scene.fog;
   const prevEnvironment = scene.environment;
+  const prevNear = camera.near;
+  const prevMinDistance = controls.minDistance;
+  const prevMaxDistance = controls.maxDistance;
   scene.background = new THREE.Color("#0a0d14");
+  // Editor ships are large (CELL=4); free dolly through the hollow hull looks like an
+  // "invisible wall" x-ray — keep the camera outside the shell.
+  camera.near = 0.05;
+  camera.updateProjectionMatrix();
+  controls.minDistance = CELL * 1.5;
+  controls.maxDistance = 400;
   // The shared scene carries a default near-range fog (far 30) sized for the
   // small demo scenes — this editor's camera orbits at ~50+ units, which
   // would put the whole ship past the fog's far plane. No fog wanted in an editor.
@@ -930,6 +939,8 @@ function setup(ctx: SceneContext): SceneInstance {
     // (2x2 rear layer) gets a 2x2 nozzle cluster. The hull visibly reflects the
     // propulsion layout, whichever style is on.
     const nozzleLen = 0.9 * CELL;
+    // Bury the forward end into the stern so they read as attached, not floating.
+    const embed = 0.45 * CELL;
     const nozzleGeometry = new THREE.CylinderGeometry(0.35 * CELL, 0.35 * CELL, nozzleLen, 12);
     for (const m of modules) {
       if (m.type !== "engine") continue;
@@ -938,7 +949,7 @@ function setup(ctx: SceneContext): SceneInstance {
         for (let iy = m.y; iy < m.y + m.dy; iy++) {
           const nozzle = new THREE.Mesh(nozzleGeometry, nozzleMaterial);
           nozzle.rotation.x = Math.PI / 2; // align cylinder's y axis with +z
-          nozzle.position.set(cellX(ix), cellY(iy), rz + nozzleLen / 2 - 0.1);
+          nozzle.position.set(cellX(ix), cellY(iy), rz + nozzleLen / 2 - embed);
           hullGroup.add(nozzle);
         }
       }
@@ -1193,6 +1204,8 @@ function setup(ctx: SceneContext): SceneInstance {
       diag = Math.hypot(maxWX - minWX, maxWY - minWY, maxWZ - minWZ);
     }
     controls.target.copy(target);
+    // Keep dolly outside the hull so the near plane can't slice the shell (x-ray wall).
+    controls.minDistance = Math.max(CELL * 1.5, diag * 0.55);
     // A portrait phone's horizontal FOV is the binding constraint here
     // (~27° at 55° vertical on a 390x844 viewport), so the camera has to sit
     // much farther back than the vertical FOV alone would suggest — at the
@@ -1768,9 +1781,12 @@ function setup(ctx: SceneContext): SceneInstance {
       scene.background = prevBackground;
       scene.fog = prevFog;
       scene.environment = prevEnvironment;
+      camera.near = prevNear;
       camera.position.set(3, 2, 4);
       camera.quaternion.identity();
       camera.updateProjectionMatrix();
+      controls.minDistance = prevMinDistance;
+      controls.maxDistance = prevMaxDistance;
       controls.target.set(0, 0, 0);
       controls.enabled = true;
       controls.update();
