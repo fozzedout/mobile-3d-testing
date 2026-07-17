@@ -762,77 +762,127 @@ function setup(ctx: SceneContext): SceneInstance {
     if (state.hullStyle === "plated") buildPlatedHull();
     else buildBoxHull();
   }
-  // Form-fitting cover: merge exact occupied cells into maximal rectangular solids,
-  // then inflate slightly. Follows the real layout (no AABB-filled empty corners) but
-  // reads as welded hull sections instead of a per-cell vacuum pack. Structure fairings
-  // still shape the silhouette by extending occupancy where you want taper/flare.
+  // Smoothed cover: loft elliptical cross-sections along Z from the occupied layout,
+  // with a blur so abrupt module steps soften into a continuous fuselage. Structure
+  // fairings still matter — they widen/narrow local profiles before the blur.
   function buildPlatedHull(): void {
-    const occupied = new Set<string>();
-    const cellKey = (x: number, y: number, z: number): string => `${x},${y},${z}`;
-    let minX = Infinity, minY = Infinity, minZ = Infinity;
-    let maxX = -Infinity, maxY = -Infinity, maxZ = -Infinity;
+    type Layer = { cx: number; cy: number; rx: number; ry: number };
+    const layers = new Map<number, Layer>();
+    const byZ = new Map<number, { minX: number; maxX: number; minY: number; maxY: number }>();
     for (const m of modules) {
       for (let ix = m.x; ix < m.x + m.dx; ix++) {
         for (let iy = m.y; iy < m.y + m.dy; iy++) {
           for (let iz = m.z; iz < m.z + m.dz; iz++) {
-            occupied.add(cellKey(ix, iy, iz));
-            minX = Math.min(minX, ix); maxX = Math.max(maxX, ix);
-            minY = Math.min(minY, iy); maxY = Math.max(maxY, iy);
-            minZ = Math.min(minZ, iz); maxZ = Math.max(maxZ, iz);
+            const s = byZ.get(iz);
+            if (!s) byZ.set(iz, { minX: ix, maxX: ix, minY: iy, maxY: iy });
+            else {
+              s.minX = Math.min(s.minX, ix); s.maxX = Math.max(s.maxX, ix);
+              s.minY = Math.min(s.minY, iy); s.maxY = Math.max(s.maxY, iy);
+            }
           }
         }
       }
     }
-    if (occupied.size === 0) return;
+    for (const [iz, s] of byZ) {
+      layers.set(iz, {
+        cx: cellX((s.minX + s.maxX) / 2),
+        cy: cellY((s.minY + s.maxY) / 2),
+        rx: ((s.maxX - s.minX + 1) * CELL) / 2,
+        ry: ((s.maxY - s.minY + 1) * CELL) / 2,
+      });
+    }
 
-    const has = (x: number, y: number, z: number): boolean => occupied.has(cellKey(x, y, z));
-    const visited = new Set<string>();
-    const margin = 0.28 * CELL;
+    const zs = [...layers.keys()].sort((a, b) => a - b);
+    if (zs.length === 0) return;
 
-    // Greedy 3D box merge over exact occupancy — largest axis-aligned solids first.
-    for (let z = minZ; z <= maxZ; z++) {
-      for (let y = minY; y <= maxY; y++) {
-        for (let x = minX; x <= maxX; x++) {
-          if (!has(x, y, z) || visited.has(cellKey(x, y, z))) continue;
+    const pad = 0.45 * CELL;
+    const blurCells = 1.15; // how far (in cells) the profile softens along Z
+    const segs = 28;
+    const z0 = zs[0];
+    const z1 = zs[zs.length - 1];
+    // Sample past the ends so the shell tapers into a nose / stern instead of flat caps.
+    const noseZ = cellZ(z0) - CELL * 0.95;
+    const sternZ = cellZ(z1) + CELL * 0.55;
+    const samples = Math.max(16, Math.ceil(((sternZ - noseZ) / CELL) * 6));
 
-          let x1 = x;
-          while (has(x1 + 1, y, z) && !visited.has(cellKey(x1 + 1, y, z))) x1++;
+    const rawAt = (wz: number): Layer => {
+      // Soft footprint at world-z: weighted contribution from nearby cell layers.
+      let wSum = 0, cx = 0, cy = 0, rx = 0, ry = 0;
+      for (const iz of zs) {
+        const layerZ = cellZ(iz);
+        const d = Math.abs(wz - layerZ) / CELL;
+        const w = Math.max(0, 1 - d / blurCells);
+        if (w <= 0) continue;
+        const L = layers.get(iz)!;
+        wSum += w;
+        cx += L.cx * w;
+        cy += L.cy * w;
+        rx += (L.rx + pad) * w;
+        ry += (L.ry + pad) * w;
+      }
+      if (wSum <= 1e-6) return { cx: 0, cy: 0, rx: pad * 0.4, ry: pad * 0.4 };
+      return { cx: cx / wSum, cy: cy / wSum, rx: rx / wSum, ry: ry / wSum };
+    };
 
-          let y1 = y;
-          expandY: while (true) {
-            for (let ix = x; ix <= x1; ix++) {
-              if (!has(ix, y1 + 1, z) || visited.has(cellKey(ix, y1 + 1, z))) break expandY;
-            }
-            y1++;
-          }
+    const profileAt = (wz: number): Layer => {
+      const L = rawAt(wz);
+      // Nose / stern taper toward a point so the cover reads as a hull, not a tube.
+      const noseT = THREE.MathUtils.clamp((wz - noseZ) / (CELL * 0.95), 0, 1);
+      const sternT = THREE.MathUtils.clamp((sternZ - wz) / (CELL * 0.55), 0, 1);
+      const taper = Math.min(1, Math.pow(noseT, 0.65) * Math.pow(sternT, 0.5));
+      return { cx: L.cx, cy: L.cy, rx: Math.max(pad * 0.25, L.rx * taper), ry: Math.max(pad * 0.2, L.ry * taper) };
+    };
 
-          let z1 = z;
-          expandZ: while (true) {
-            for (let iy = y; iy <= y1; iy++) {
-              for (let ix = x; ix <= x1; ix++) {
-                if (!has(ix, iy, z1 + 1) || visited.has(cellKey(ix, iy, z1 + 1))) break expandZ;
-              }
-            }
-            z1++;
-          }
-
-          for (let iz = z; iz <= z1; iz++) {
-            for (let iy = y; iy <= y1; iy++) {
-              for (let ix = x; ix <= x1; ix++) visited.add(cellKey(ix, iy, iz));
-            }
-          }
-
-          const sx = (x1 - x + 1) * CELL + 2 * margin;
-          const sy = (y1 - y + 1) * CELL + 2 * margin;
-          const sz = (z1 - z + 1) * CELL + 2 * margin;
-          const body = new THREE.Mesh(new THREE.BoxGeometry(sx, sy, sz), hullMaterial);
-          body.position.set(cellX((x + x1) / 2), cellY((y + y1) / 2), cellZ((z + z1) / 2));
-          hullGroup.add(body);
-        }
+    const positions: number[] = [];
+    const indices: number[] = [];
+    const rings: Layer[] = [];
+    for (let i = 0; i <= samples; i++) {
+      const t = i / samples;
+      const wz = noseZ + (sternZ - noseZ) * t;
+      rings.push(profileAt(wz));
+      const R = rings[i];
+      for (let s = 0; s < segs; s++) {
+        const a = (s / segs) * Math.PI * 2;
+        // Superellipse (n≈2.4): rounded, slightly fuller than a pure ellipse — sleek cover.
+        const n = 2.4;
+        const ca = Math.cos(a), sa = Math.sin(a);
+        const sx = Math.sign(ca) * Math.pow(Math.abs(ca), 2 / n);
+        const sy = Math.sign(sa) * Math.pow(Math.abs(sa), 2 / n);
+        positions.push(R.cx + R.rx * sx, R.cy + R.ry * sy, wz);
       }
     }
 
-    addEngineNozzles((m) => cellZ(m.z + m.dz - 1) + CELL / 2 + margin);
+    for (let i = 0; i < samples; i++) {
+      for (let s = 0; s < segs; s++) {
+        const s2 = (s + 1) % segs;
+        const a = i * segs + s;
+        const b = i * segs + s2;
+        const c = (i + 1) * segs + s;
+        const d = (i + 1) * segs + s2;
+        indices.push(a, b, c, b, d, c);
+      }
+    }
+
+    // Tip caps (nose + stern) so the shell is closed.
+    const noseTip = positions.length / 3;
+    positions.push(rings[0].cx, rings[0].cy, noseZ - CELL * 0.15);
+    const sternTip = positions.length / 3;
+    positions.push(rings[samples].cx, rings[samples].cy, sternZ + CELL * 0.1);
+    for (let s = 0; s < segs; s++) {
+      const s2 = (s + 1) % segs;
+      indices.push(noseTip, s, s2);
+      const a = samples * segs + s;
+      const b = samples * segs + s2;
+      indices.push(sternTip, b, a);
+    }
+
+    const geo = new THREE.BufferGeometry();
+    geo.setAttribute("position", new THREE.Float32BufferAttribute(positions, 3));
+    geo.setIndex(indices);
+    geo.computeVertexNormals();
+    hullGroup.add(new THREE.Mesh(geo, hullMaterial));
+
+    addEngineNozzles((m) => cellZ(m.z + m.dz - 1) + CELL / 2 + pad * 0.5);
   }
   // The original single-shell alternative, kept for comparison: an inflated
   // box over the installed modules' bounding volume with a cone nose.
