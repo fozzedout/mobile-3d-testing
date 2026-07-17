@@ -762,82 +762,75 @@ function setup(ctx: SceneContext): SceneInstance {
     if (state.hullStyle === "plated") buildPlatedHull();
     else buildBoxHull();
   }
-  // Form-fitting shell: for each Z-slice of occupied cells, take the cross-section
-  // AABB and merge consecutive identical slices into one inflated box. That covers
-  // the modules as a sleek fuselage rather than shrink-wrapping every cell. Structure
-  // fairings push those slice bounds out so you can taper, flare, or fill gaps without
-  // adding functional mass/power.
+  // Form-fitting cover: merge exact occupied cells into maximal rectangular solids,
+  // then inflate slightly. Follows the real layout (no AABB-filled empty corners) but
+  // reads as welded hull sections instead of a per-cell vacuum pack. Structure fairings
+  // still shape the silhouette by extending occupancy where you want taper/flare.
   function buildPlatedHull(): void {
-    type Slice = { minX: number; maxX: number; minY: number; maxY: number };
-    const byZ = new Map<number, Slice>();
+    const occupied = new Set<string>();
+    const cellKey = (x: number, y: number, z: number): string => `${x},${y},${z}`;
+    let minX = Infinity, minY = Infinity, minZ = Infinity;
+    let maxX = -Infinity, maxY = -Infinity, maxZ = -Infinity;
     for (const m of modules) {
       for (let ix = m.x; ix < m.x + m.dx; ix++) {
         for (let iy = m.y; iy < m.y + m.dy; iy++) {
           for (let iz = m.z; iz < m.z + m.dz; iz++) {
-            const s = byZ.get(iz);
-            if (!s) byZ.set(iz, { minX: ix, maxX: ix, minY: iy, maxY: iy });
-            else {
-              s.minX = Math.min(s.minX, ix); s.maxX = Math.max(s.maxX, ix);
-              s.minY = Math.min(s.minY, iy); s.maxY = Math.max(s.maxY, iy);
-            }
+            occupied.add(cellKey(ix, iy, iz));
+            minX = Math.min(minX, ix); maxX = Math.max(maxX, ix);
+            minY = Math.min(minY, iy); maxY = Math.max(maxY, iy);
+            minZ = Math.min(minZ, iz); maxZ = Math.max(maxZ, iz);
           }
         }
       }
     }
-    const zs = [...byZ.keys()].sort((a, b) => a - b);
-    if (zs.length === 0) return;
+    if (occupied.size === 0) return;
 
-    const sameSlice = (a: Slice, b: Slice): boolean =>
-      a.minX === b.minX && a.maxX === b.maxX && a.minY === b.minY && a.maxY === b.maxY;
+    const has = (x: number, y: number, z: number): boolean => occupied.has(cellKey(x, y, z));
+    const visited = new Set<string>();
+    const margin = 0.28 * CELL;
 
-    const margin = 0.55 * CELL;
-    let runStart = zs[0];
-    let runEnd = zs[0];
-    let runSlice = byZ.get(zs[0])!;
+    // Greedy 3D box merge over exact occupancy — largest axis-aligned solids first.
+    for (let z = minZ; z <= maxZ; z++) {
+      for (let y = minY; y <= maxY; y++) {
+        for (let x = minX; x <= maxX; x++) {
+          if (!has(x, y, z) || visited.has(cellKey(x, y, z))) continue;
 
-    const flushRun = (): void => {
-      const sx = (runSlice.maxX - runSlice.minX + 1) * CELL + 2 * margin;
-      const sy = (runSlice.maxY - runSlice.minY + 1) * CELL + 2 * margin;
-      const sz = (runEnd - runStart + 1) * CELL + 2 * margin * 0.35;
-      const cx = cellX((runSlice.minX + runSlice.maxX) / 2);
-      const cy = cellY((runSlice.minY + runSlice.maxY) / 2);
-      const cz = cellZ((runStart + runEnd) / 2);
-      const body = new THREE.Mesh(new THREE.BoxGeometry(sx, sy, sz), hullMaterial);
-      body.position.set(cx, cy, cz);
-      hullGroup.add(body);
-    };
+          let x1 = x;
+          while (has(x1 + 1, y, z) && !visited.has(cellKey(x1 + 1, y, z))) x1++;
 
-    for (let i = 1; i < zs.length; i++) {
-      const z = zs[i];
-      const slice = byZ.get(z)!;
-      // Only merge contiguous z layers with identical cross-section bounds.
-      if (z === runEnd + 1 && sameSlice(slice, runSlice)) {
-        runEnd = z;
-        continue;
+          let y1 = y;
+          expandY: while (true) {
+            for (let ix = x; ix <= x1; ix++) {
+              if (!has(ix, y1 + 1, z) || visited.has(cellKey(ix, y1 + 1, z))) break expandY;
+            }
+            y1++;
+          }
+
+          let z1 = z;
+          expandZ: while (true) {
+            for (let iy = y; iy <= y1; iy++) {
+              for (let ix = x; ix <= x1; ix++) {
+                if (!has(ix, iy, z1 + 1) || visited.has(cellKey(ix, iy, z1 + 1))) break expandZ;
+              }
+            }
+            z1++;
+          }
+
+          for (let iz = z; iz <= z1; iz++) {
+            for (let iy = y; iy <= y1; iy++) {
+              for (let ix = x; ix <= x1; ix++) visited.add(cellKey(ix, iy, iz));
+            }
+          }
+
+          const sx = (x1 - x + 1) * CELL + 2 * margin;
+          const sy = (y1 - y + 1) * CELL + 2 * margin;
+          const sz = (z1 - z + 1) * CELL + 2 * margin;
+          const body = new THREE.Mesh(new THREE.BoxGeometry(sx, sy, sz), hullMaterial);
+          body.position.set(cellX((x + x1) / 2), cellY((y + y1) / 2), cellZ((z + z1) / 2));
+          hullGroup.add(body);
+        }
       }
-      flushRun();
-      runStart = z;
-      runEnd = z;
-      runSlice = slice;
     }
-    flushRun();
-
-    // Soft nose cap on the forward-most slice — reads as a cover, not a brick stack.
-    const noseSlice = byZ.get(zs[0])!;
-    const noseW = (noseSlice.maxX - noseSlice.minX + 1) * CELL + 2 * margin;
-    const noseH = (noseSlice.maxY - noseSlice.minY + 1) * CELL + 2 * margin;
-    const noseLen = 0.85 * CELL;
-    const nose = new THREE.Mesh(
-      new THREE.ConeGeometry(Math.max(noseW, noseH) * 0.38, noseLen, 4),
-      hullMaterial,
-    );
-    nose.rotation.x = -Math.PI / 2;
-    nose.position.set(
-      cellX((noseSlice.minX + noseSlice.maxX) / 2),
-      cellY((noseSlice.minY + noseSlice.maxY) / 2),
-      cellZ(zs[0]) - CELL / 2 - noseLen * 0.35,
-    );
-    hullGroup.add(nose);
 
     addEngineNozzles((m) => cellZ(m.z + m.dz - 1) + CELL / 2 + margin);
   }
