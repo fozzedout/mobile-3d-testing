@@ -446,11 +446,65 @@ body {
   background: #2b2f3a;
 }
 
+/* Structure fairing shape menu — sits above the type palette. */
+.ship-structure-menu {
+  position: fixed;
+  left: 50%;
+  bottom: calc(var(--safe-bottom) + 12px + 72px);
+  transform: translateX(-50%);
+  z-index: 26;
+  display: flex;
+  align-items: center;
+  gap: 6px;
+  max-width: calc(100vw - 16px);
+  padding: 8px;
+  background: rgba(20, 22, 28, 0.9);
+  border: 1px solid #2b2f3a;
+  border-radius: 12px;
+  backdrop-filter: blur(6px);
+  pointer-events: auto;
+  touch-action: none;
+  overflow-x: auto;
+  -webkit-overflow-scrolling: touch;
+}
+
+.ship-structure-menu-label {
+  font-size: 12px;
+  font-weight: 700;
+  color: #9aa2b1;
+  letter-spacing: 0.04em;
+  text-transform: uppercase;
+  padding: 0 4px;
+  white-space: nowrap;
+}
+
+.ship-structure-btn {
+  width: 44px;
+  height: 44px;
+  padding: 0;
+  border: 1px solid #2b2f3a;
+  border-radius: 8px;
+  background-color: #14161c;
+  background-size: cover;
+  background-position: center;
+  background-repeat: no-repeat;
+  flex: none;
+}
+
+.ship-structure-btn--active {
+  border-color: #43f08a;
+  box-shadow: inset 0 0 0 1px #43f08a;
+}
+
+.ship-structure-btn:active {
+  border-color: #43f08a;
+}
+
 .ship-actions {
   position: fixed;
   left: 50%;
-  /* Sits above the palette bar (palette height 64px + a gap). */
-  bottom: calc(var(--safe-bottom) + 12px + 72px);
+  /* Above palette + fairing shape menu. */
+  bottom: calc(var(--safe-bottom) + 12px + 72px + 64px);
   transform: translateX(-50%);
   z-index: 26;
   display: flex;

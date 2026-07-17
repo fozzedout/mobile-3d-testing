@@ -1,7 +1,7 @@
 import * as THREE from "three";
 import { RoomEnvironment } from "three/examples/jsm/environments/RoomEnvironment.js";
 import type { SceneContext, SceneInstance, TestScene } from "./types.ts";
-import { buildSdfHullGeometry, type HullBox } from "./ship-hull-sdf.ts";
+import { buildSdfHullGeometry, type HullPrimitive } from "./ship-hull-sdf.ts";
 
 // One grid cell is 4 world units on a side. Space is an UNBOUNDED integer lattice:
 // cell (x,y,z) sits at world (x*CELL, y*CELL, z*CELL) and coords may go negative. There
@@ -17,12 +17,22 @@ type ModuleType = "reactor" | "engine" | "fuel" | "weapon" | "shield" | "cargo" 
 // unrotated default. S and XL are cubes, so their rotation is a visual no-op (fine).
 // Footprints in cells: S = 1, M = 2 (1x1x2), L = 4 (2x1x2), XL = 8 (2x2x2).
 type ModuleSize = "S" | "M" | "L" | "XL";
+/** Fairing silhouette for structure modules — drives preview mesh + skinned SDF. */
+type StructureShape = "block" | "cone" | "wedge" | "dome" | "semi";
 type ViewMode = "internal" | "exterior" | "performance";
 type PrefabName = "fighter" | "trader";
 type HullStyle = "skinned" | "plated" | "box";
 
 const MODULE_TYPES: ModuleType[] = ["reactor", "engine", "fuel", "weapon", "shield", "cargo", "crew", "structure"];
 const MODULE_SIZES: ModuleSize[] = ["S", "M", "L", "XL"];
+const STRUCTURE_SHAPES: StructureShape[] = ["block", "cone", "wedge", "dome", "semi"];
+const STRUCTURE_SHAPE_LABEL: Record<StructureShape, string> = {
+  block: "Block",
+  cone: "Cone",
+  wedge: "Wedge",
+  dome: "Dome",
+  semi: "Semi",
+};
 
 // Footprint dims (dx, dy, dz) in cells for each size. dx = width (x), dy = height (y),
 // dz = length (z). This is the unrotated default; rotation swaps dx and dz per-module.
@@ -122,6 +132,8 @@ const PREFABS: Record<PrefabName, PrefabDef> = {
 interface Module {
   type: ModuleType;
   size: ModuleSize;
+  /** Structure fairing style; ignored for functional modules (always "block"). */
+  shape: StructureShape;
   // Anchor = the module's minimum corner cell; the footprint occupies
   // [x, x+dx) x [y, y+dy) x [z, z+dz). dims start from size and mutate on rotation.
   x: number;
@@ -286,6 +298,101 @@ function makeIconTexture(type: ModuleType, size: ModuleSize): THREE.CanvasTextur
   return tex;
 }
 
+function drawStructureShapeGlyph(g: CanvasRenderingContext2D, shape: StructureShape): void {
+  g.strokeStyle = "#ffffff";
+  g.fillStyle = "#ffffff";
+  g.lineWidth = 8;
+  g.lineJoin = "round";
+  g.lineCap = "round";
+  switch (shape) {
+    case "block":
+      g.strokeRect(34, 34, 60, 60);
+      break;
+    case "cone":
+      g.beginPath();
+      g.moveTo(64, 22);
+      g.lineTo(98, 100);
+      g.lineTo(30, 100);
+      g.closePath();
+      g.stroke();
+      break;
+    case "wedge":
+      g.beginPath();
+      g.moveTo(28, 96);
+      g.lineTo(100, 96);
+      g.lineTo(64, 28);
+      g.closePath();
+      g.stroke();
+      break;
+    case "dome":
+      g.beginPath();
+      g.arc(64, 64, 34, 0, Math.PI * 2);
+      g.stroke();
+      break;
+    case "semi":
+      g.beginPath();
+      g.arc(64, 78, 36, Math.PI, 0);
+      g.lineTo(100, 78);
+      g.stroke();
+      break;
+  }
+}
+
+function makeStructureShapeIcon(shape: StructureShape): THREE.CanvasTexture {
+  const canvas = document.createElement("canvas");
+  canvas.width = 128;
+  canvas.height = 128;
+  const g = canvas.getContext("2d") as CanvasRenderingContext2D;
+  g.fillStyle = SPECS.structure.color;
+  g.fillRect(0, 0, 128, 128);
+  g.shadowColor = "rgba(0,0,0,0.45)";
+  g.shadowBlur = 6;
+  g.shadowOffsetX = 2;
+  g.shadowOffsetY = 2;
+  drawStructureShapeGlyph(g, shape);
+  const tex = new THREE.CanvasTexture(canvas);
+  tex.colorSpace = THREE.SRGBColorSpace;
+  return tex;
+}
+
+/** Preview / internal mesh for a structure fairing, sized to the footprint. */
+function buildStructureGeometry(shape: StructureShape, dx: number, dy: number, dz: number): THREE.BufferGeometry {
+  const sx = dx * CELL * 0.86;
+  const sy = dy * CELL * 0.86;
+  const sz = dz * CELL * 0.86;
+  switch (shape) {
+    case "block":
+      return new THREE.BoxGeometry(sx, sy, sz);
+    case "cone": {
+      const g = new THREE.ConeGeometry(Math.max(sx, sy) * 0.5, sz, 20);
+      g.rotateX(-Math.PI / 2); // tip toward -Z (nose)
+      return g;
+    }
+    case "wedge": {
+      const sh = new THREE.Shape();
+      sh.moveTo(-sx / 2, -sy / 2);
+      sh.lineTo(sx / 2, -sy / 2);
+      sh.lineTo(0, sy / 2);
+      sh.closePath();
+      const g = new THREE.ExtrudeGeometry(sh, { depth: sz, bevelEnabled: false, curveSegments: 1 });
+      g.translate(0, 0, -sz / 2);
+      return g;
+    }
+    case "dome": {
+      const g = new THREE.SphereGeometry(1, 22, 16);
+      g.scale(sx / 2, sy / 2, sz / 2);
+      return g;
+    }
+    case "semi": {
+      // Upper hemisphere in +Y, flat on the equator.
+      const g = new THREE.SphereGeometry(1, 22, 12, 0, Math.PI * 2, 0, Math.PI / 2);
+      g.scale(sx / 2, sy, sz / 2);
+      g.translate(0, -sy / 2, 0); // sit flat on the cell floor
+      return g;
+    }
+  }
+}
+
 function setup(ctx: SceneContext): SceneInstance {
   const { scene, gui, camera, controls, canvas, renderer } = ctx;
 
@@ -320,14 +427,25 @@ function setup(ctx: SceneContext): SceneInstance {
   // One box geometry per FOOTPRINT DIMS triple (dims, not size, because rotation gives a
   // module a footprint its size's default doesn't have), shared across every module of
   // those dims. Disposed at teardown; modules only own/dispose their material.
-  const moduleGeomCache = new Map<string, THREE.BoxGeometry>();
+  const moduleGeomCache = new Map<string, THREE.BufferGeometry>();
   const dimsKey = (dx: number, dy: number, dz: number): string => `${dx}x${dy}x${dz}`;
-  function moduleGeometryFor(dx: number, dy: number, dz: number): THREE.BoxGeometry {
+  function moduleGeometryFor(dx: number, dy: number, dz: number): THREE.BufferGeometry {
     const key = dimsKey(dx, dy, dz);
     let g = moduleGeomCache.get(key);
     if (!g) {
       g = new THREE.BoxGeometry(dx * CELL * 0.86, dy * CELL * 0.86, dz * CELL * 0.86);
       moduleGeomCache.set(key, g);
+    }
+    return g;
+  }
+  // Structure fairing meshes are per (shape, dims) — cones/domes don't share the box cache.
+  const structureGeomCache = new Map<string, THREE.BufferGeometry>();
+  function structureGeometryFor(shape: StructureShape, dx: number, dy: number, dz: number): THREE.BufferGeometry {
+    const key = `${shape}:${dimsKey(dx, dy, dz)}`;
+    let g = structureGeomCache.get(key);
+    if (!g) {
+      g = buildStructureGeometry(shape, dx, dy, dz);
+      structureGeomCache.set(key, g);
     }
     return g;
   }
@@ -340,9 +458,15 @@ function setup(ctx: SceneContext): SceneInstance {
       iconTextures.set(iconKey(type, size), makeIconTexture(type, size));
     }
   }
+  const structureShapeIcons = new Map<StructureShape, THREE.CanvasTexture>();
+  for (const shape of STRUCTURE_SHAPES) {
+    structureShapeIcons.set(shape, makeStructureShapeIcon(shape));
+  }
   // Data-URL of an icon's baked canvas, so a DOM button can wear the exact same tile.
   const iconDataURL = (type: ModuleType, size: ModuleSize): string =>
     (iconTextures.get(iconKey(type, size))!.image as HTMLCanvasElement).toDataURL();
+  const structureShapeDataURL = (shape: StructureShape): string =>
+    (structureShapeIcons.get(shape)!.image as HTMLCanvasElement).toDataURL();
 
   // Subtle panel lines — same canvas bake path as module icons — keep the shell from
   // reading as a featureless balloon once clearcoat + env reflections kick in.
@@ -399,6 +523,7 @@ function setup(ctx: SceneContext): SceneInstance {
     view: "internal" as ViewMode,
     prefab: "fighter" as PrefabName,
     paletteSize: "S" as ModuleSize,
+    structureShape: "block" as StructureShape,
     hullColor: "#5a6b8c",
     hullStyle: "skinned" as HullStyle,
   };
@@ -512,23 +637,30 @@ function setup(ctx: SceneContext): SceneInstance {
   }
   // Builds a module + its mesh WITHOUT registering it in the layout (used by the drag
   // preview, which floats a not-yet-committed block). addModuleAt() does the registering.
-  function createModule(type: ModuleType, size: ModuleSize, x: number, y: number, z: number): Module {
+  function createModule(type: ModuleType, size: ModuleSize, x: number, y: number, z: number, shape?: StructureShape): Module {
     const [dx, dy, dz] = SIZE_DIMS[size];
+    const resolvedShape: StructureShape = type === "structure" ? (shape ?? state.structureShape) : "block";
     // Base color WHITE so the icon texture's baked colors show true; restyle() drives the
     // per-state tints (invalid red / heat lerp / drag preview) as multiplies over it.
+    const map = type === "structure"
+      ? structureShapeIcons.get(resolvedShape) ?? null
+      : iconTextures.get(iconKey(type, size)) ?? null;
     const material = new THREE.MeshStandardMaterial({
       color: "#ffffff",
-      map: iconTextures.get(iconKey(type, size)) ?? null,
+      map,
       metalness: 0.2,
       roughness: 0.6,
     });
-    const mesh = new THREE.Mesh(moduleGeometryFor(dx, dy, dz), material);
-    const m: Module = { type, size, x, y, z, dx, dy, dz, mesh, material };
+    const geo = type === "structure"
+      ? structureGeometryFor(resolvedShape, dx, dy, dz)
+      : moduleGeometryFor(dx, dy, dz);
+    const mesh = new THREE.Mesh(geo, material);
+    const m: Module = { type, size, shape: resolvedShape, x, y, z, dx, dy, dz, mesh, material };
     positionModuleMesh(mesh, m);
     return m;
   }
-  function addModuleAt(type: ModuleType, size: ModuleSize, x: number, y: number, z: number): Module {
-    const m = createModule(type, size, x, y, z);
+  function addModuleAt(type: ModuleType, size: ModuleSize, x: number, y: number, z: number, shape?: StructureShape): Module {
+    const m = createModule(type, size, x, y, z, shape);
     moduleGroup.add(m.mesh);
     modules.push(m);
     meshToModule.set(m.mesh, m);
@@ -568,7 +700,9 @@ function setup(ctx: SceneContext): SceneInstance {
     } else {
       const n = m.dz; m.dz = m.dy; m.dy = n;
     }
-    m.mesh.geometry = moduleGeometryFor(m.dx, m.dy, m.dz);
+    m.mesh.geometry = m.type === "structure"
+      ? structureGeometryFor(m.shape, m.dx, m.dy, m.dz)
+      : moduleGeometryFor(m.dx, m.dy, m.dz);
     positionModuleMesh(m.mesh, m);
   }
 
@@ -717,7 +851,8 @@ function setup(ctx: SceneContext): SceneInstance {
 
   function selectionLabel(m: Module): string {
     const cells = m.dx * m.dy * m.dz;
-    return `${m.type} ${m.size} · ${cells} cell${cells > 1 ? "s" : ""}`;
+    const shapeBit = m.type === "structure" ? ` ${STRUCTURE_SHAPE_LABEL[m.shape]}` : "";
+    return `${m.type}${shapeBit} ${m.size} · ${cells} cell${cells > 1 ? "s" : ""}`;
   }
 
   // ---- visual styling ---------------------------------------------------------------
@@ -812,24 +947,31 @@ function setup(ctx: SceneContext): SceneInstance {
     else buildBoxHull();
   }
 
-  // SDF smooth-union of rounded module boxes → marching cubes. Follows nacelles /
-  // wings / asymmetric layouts; k is the fillet width ("sleekness").
+  // SDF smooth-union of module primitives → marching cubes. Structure shapes (cone,
+  // wedge, dome, …) become matching SDF prims so fairings sculpt the skinned shell.
   function buildSkinnedHull(): void {
-    const boxes: HullBox[] = [];
-    const skin = 0.22 * CELL; // cover thickness outside the module footprint
+    const prims: HullPrimitive[] = [];
+    const skin = 0.22 * CELL;
     const round = 0.38 * CELL;
     for (const m of modules) {
       const c = footprintCenter(m.x, m.y, m.z, m.dx, m.dy, m.dz);
-      boxes.push({
-        cx: c.x, cy: c.y, cz: c.z,
-        hx: (m.dx * CELL) / 2 + skin,
-        hy: (m.dy * CELL) / 2 + skin,
-        hz: (m.dz * CELL) / 2 + skin,
-        radius: round,
-      });
+      const hx = (m.dx * CELL) / 2 + skin;
+      const hy = (m.dy * CELL) / 2 + skin;
+      const hz = (m.dz * CELL) / 2 + skin;
+      if (m.type !== "structure" || m.shape === "block") {
+        prims.push({ kind: "box", cx: c.x, cy: c.y, cz: c.z, hx, hy, hz, radius: round });
+      } else if (m.shape === "cone") {
+        prims.push({ kind: "cone", cx: c.x, cy: c.y, cz: c.z, hx, hy, hz });
+      } else if (m.shape === "wedge") {
+        prims.push({ kind: "wedge", cx: c.x, cy: c.y, cz: c.z, hx, hy, hz });
+      } else if (m.shape === "dome") {
+        prims.push({ kind: "dome", cx: c.x, cy: c.y, cz: c.z, hx, hy, hz });
+      } else {
+        prims.push({ kind: "semi", cx: c.x, cy: c.y, cz: c.z, hx, hy, hz });
+      }
     }
-    const geo = buildSdfHullGeometry(boxes, {
-      smoothK: 1.25 * CELL * 0.35, // ~1.25 world units of fillet between modules
+    const geo = buildSdfHullGeometry(prims, {
+      smoothK: 1.25 * CELL * 0.35,
       samplesPerCell: 3.5,
       cellSize: CELL,
       pad: CELL * 1.1,
@@ -1091,7 +1233,7 @@ function setup(ctx: SceneContext): SceneInstance {
       readout.status = "No room to duplicate — free up a face first";
       return;
     }
-    const copy = addModuleAt(selected.type, selected.size, dest.x, dest.y, dest.z);
+    const copy = addModuleAt(selected.type, selected.size, dest.x, dest.y, dest.z, selected.shape);
     // A duplicate of a rotated module should match its orientation.
     if (copy.dx !== selected.dx || copy.dz !== selected.dz) {
       copy.dx = selected.dx;
@@ -1166,6 +1308,7 @@ function setup(ctx: SceneContext): SceneInstance {
     isNew: boolean;        // spawned from the palette → discard on invalid release
     type: ModuleType;      // spawn descriptor (isNew only)
     size: ModuleSize;
+    shape: StructureShape;
     pointerId: number;
     startX: number;
     startY: number;
@@ -1225,7 +1368,7 @@ function setup(ctx: SceneContext): SceneInstance {
     // A palette module is created on the first canvas hover (its mesh is the preview).
     if (dg.isNew && !dg.module) {
       if (!over) return;
-      const m = createModule(dg.type, dg.size, 0, 0, 0);
+      const m = createModule(dg.type, dg.size, 0, 0, 0, dg.shape);
       m.mesh.visible = false;
       moduleGroup.add(m.mesh);
       dg.module = m;
@@ -1337,7 +1480,7 @@ function setup(ctx: SceneContext): SceneInstance {
     if (m) {
       controls.enabled = false;
       select(m);
-      drag = { module: m, isNew: false, type: m.type, size: m.size, pointerId: e.pointerId, startX: e.clientX, startY: e.clientY, moved: false, candidate: null, valid: false };
+      drag = { module: m, isNew: false, type: m.type, size: m.size, shape: m.shape, pointerId: e.pointerId, startX: e.clientX, startY: e.clientY, moved: false, candidate: null, valid: false };
       try { canvas.setPointerCapture(e.pointerId); } catch { /* capture is a nicety */ }
     } else {
       emptyTap = { pointerId: e.pointerId, startX: e.clientX, startY: e.clientY };
@@ -1409,7 +1552,8 @@ function setup(ctx: SceneContext): SceneInstance {
     updateBars();
   }
 
-  // Palette: a row of 7 type icons (drag one onto the canvas to spawn it) + a size cycle.
+  // Palette: type icons (drag onto canvas) + size cycle. Structure fairing *shape* lives
+  // on the second menu above this bar.
   const paletteBar = document.createElement("div");
   paletteBar.className = "ship-palette";
   const paletteButtons: { btn: HTMLButtonElement; type: ModuleType }[] = [];
@@ -1440,6 +1584,31 @@ function setup(ctx: SceneContext): SceneInstance {
   paletteBar.appendChild(trashHint);
   document.body.appendChild(paletteBar);
 
+  // Second menu: structure fairing shapes (block / cone / wedge / dome / semi). Selecting
+  // one sets the style used when you drag a structure block from the palette below.
+  const structureMenu = document.createElement("div");
+  structureMenu.className = "ship-structure-menu";
+  const structureMenuLabel = document.createElement("span");
+  structureMenuLabel.className = "ship-structure-menu-label";
+  structureMenuLabel.textContent = "Fairing";
+  structureMenu.appendChild(structureMenuLabel);
+  const structureShapeButtons: { btn: HTMLButtonElement; shape: StructureShape }[] = [];
+  for (const shape of STRUCTURE_SHAPES) {
+    const btn = document.createElement("button");
+    btn.className = "ship-structure-btn";
+    btn.dataset.shape = shape;
+    btn.title = STRUCTURE_SHAPE_LABEL[shape];
+    btn.setAttribute("aria-label", `structure shape ${STRUCTURE_SHAPE_LABEL[shape]}`);
+    btn.style.backgroundImage = `url(${structureShapeDataURL(shape)})`;
+    btn.addEventListener("click", () => {
+      state.structureShape = shape;
+      refreshStructureShapeButtons();
+    });
+    structureMenu.appendChild(btn);
+    structureShapeButtons.push({ btn, shape });
+  }
+  document.body.appendChild(structureMenu);
+
   // The palette bar doubles as a trash target during a module drag (see onDocPointerMove).
   function pointerInPalette(clientX: number, clientY: number): boolean {
     const r = paletteBar.getBoundingClientRect();
@@ -1452,6 +1621,11 @@ function setup(ctx: SceneContext): SceneInstance {
     paletteBar.classList.remove("ship-palette--trash", "ship-palette--trash-hot");
   }
 
+  function refreshStructureShapeButtons(): void {
+    for (const { btn, shape } of structureShapeButtons) {
+      btn.classList.toggle("ship-structure-btn--active", shape === state.structureShape);
+    }
+  }
   function refreshPaletteIcons(): void {
     for (const { btn, type } of paletteButtons) btn.style.backgroundImage = `url(${iconDataURL(type, state.paletteSize)})`;
     sizeBtn.textContent = state.paletteSize;
@@ -1459,7 +1633,19 @@ function setup(ctx: SceneContext): SceneInstance {
   function onPaletteDown(e: PointerEvent, type: ModuleType): void {
     if (state.view === "exterior" || drag) return;
     e.preventDefault();
-    drag = { module: null, isNew: true, type, size: state.paletteSize, pointerId: e.pointerId, startX: e.clientX, startY: e.clientY, moved: true, candidate: null, valid: false };
+    drag = {
+      module: null,
+      isNew: true,
+      type,
+      size: state.paletteSize,
+      shape: type === "structure" ? state.structureShape : "block",
+      pointerId: e.pointerId,
+      startX: e.clientX,
+      startY: e.clientY,
+      moved: true,
+      candidate: null,
+      valid: false,
+    };
   }
 
   // Action bar: shown only while a module is selected — rotate / duplicate / remove it.
@@ -1484,10 +1670,11 @@ function setup(ctx: SceneContext): SceneInstance {
   mkActionBtn("✕ Remove", "remove", "remove module", removeSelected);
   document.body.appendChild(actionBar);
 
-  // Both bars hide in exterior (read-only) view; the action bar also hides with no selection.
+  // Palette + fairing menu hide in exterior; action bar also hides with no selection.
   function updateBars(): void {
     const editing = state.view !== "exterior";
     paletteBar.classList.toggle("ship-hidden", !editing);
+    structureMenu.classList.toggle("ship-hidden", !editing);
     const showActions = editing && selected !== null;
     actionBar.classList.toggle("ship-hidden", !showActions);
     if (selected) actionLabel.textContent = selectionLabel(selected);
@@ -1530,6 +1717,7 @@ function setup(ctx: SceneContext): SceneInstance {
   // Initial layout: the fighter, framed and validated. (refreshPaletteIcons after the
   // bars + GUI exist so button tiles are stamped once.)
   refreshPaletteIcons();
+  refreshStructureShapeButtons();
   loadPrefab("fighter");
 
   return {
@@ -1539,6 +1727,7 @@ function setup(ctx: SceneContext): SceneInstance {
       document.removeEventListener("pointerup", onDocPointerUp);
       document.removeEventListener("pointercancel", onDocPointerCancel);
       paletteBar.remove();
+      structureMenu.remove();
       actionBar.remove();
 
       // A palette ghost may be mid-flight (never registered in `modules`) — dispose it.
@@ -1552,7 +1741,9 @@ function setup(ctx: SceneContext): SceneInstance {
       disposeHullMeshes();
 
       for (const g of moduleGeomCache.values()) g.dispose();
+      for (const g of structureGeomCache.values()) g.dispose();
       for (const t of iconTextures.values()) t.dispose();
+      for (const t of structureShapeIcons.values()) t.dispose();
       hullPanelMap.dispose();
       hullMaterial.dispose();
       nozzleMaterial.dispose();

@@ -5,17 +5,17 @@ import { edgeTable as edgeTableRaw, triTable as triTableRaw } from "three/exampl
 const edgeTable = edgeTableRaw as unknown as Int32Array;
 const triTable = triTableRaw as unknown as Int32Array;
 
-/** Axis-aligned rounded box in world space (half-extents + corner radius). */
-export interface HullBox {
-  cx: number;
-  cy: number;
-  cz: number;
-  hx: number;
-  hy: number;
-  hz: number;
-  /** Corner roundness; larger = softer module. */
-  radius: number;
-}
+/** Structure / module SDF primitives in world space (axis-aligned AABB of half-extents). */
+export type HullPrimitive =
+  | { kind: "box"; cx: number; cy: number; cz: number; hx: number; hy: number; hz: number; radius: number }
+  /** Cone: tip at local -Z, elliptical base at +Z. */
+  | { kind: "cone"; cx: number; cy: number; cz: number; hx: number; hy: number; hz: number }
+  /** Wedge: triangular prism, ridge along Z, base on -Y (roof ramp). */
+  | { kind: "wedge"; cx: number; cy: number; cz: number; hx: number; hy: number; hz: number }
+  /** Dome: full ellipsoid inscribed in the AABB. */
+  | { kind: "dome"; cx: number; cy: number; cz: number; hx: number; hy: number; hz: number }
+  /** Semi-dome: upper (+Y) hemisphere / half-ellipsoid, flat on -Y. */
+  | { kind: "semi"; cx: number; cy: number; cz: number; hx: number; hy: number; hz: number };
 
 function sdRoundBox(
   px: number, py: number, pz: number,
@@ -25,12 +25,114 @@ function sdRoundBox(
   const qx = Math.abs(px) - hx + r;
   const qy = Math.abs(py) - hy + r;
   const qz = Math.abs(pz) - hz + r;
-  const ox = Math.max(qx, 0);
-  const oy = Math.max(qy, 0);
-  const oz = Math.max(qz, 0);
-  const outside = Math.hypot(ox, oy, oz);
+  const outside = Math.hypot(Math.max(qx, 0), Math.max(qy, 0), Math.max(qz, 0));
   const inside = Math.min(Math.max(qx, qy, qz), 0);
   return outside + inside - r;
+}
+
+function sdEllipsoid(px: number, py: number, pz: number, hx: number, hy: number, hz: number): number {
+  const k0 = Math.hypot(px / hx, py / hy, pz / hz);
+  const k1 = Math.hypot(px / (hx * hx), py / (hy * hy), pz / (hz * hz));
+  return k0 === 0 ? Math.min(hx, hy, hz) * -1 : k0 * (k0 - 1) / k1;
+}
+
+/** Cone tip at z=-hz, elliptical base radii (hx,hy) at z=+hz. */
+function sdCone(px: number, py: number, pz: number, hx: number, hy: number, hz: number): number {
+  const t = (pz + hz) / Math.max(2 * hz, 1e-6); // 0 at tip, 1 at base
+  if (t <= 0) return Math.hypot(px, py, pz + hz); // beyond tip
+  const rx = Math.max(1e-4, hx * Math.min(t, 1));
+  const ry = Math.max(1e-4, hy * Math.min(t, 1));
+  const radial = Math.hypot(px / rx, py / ry) - 1;
+  if (t > 1) {
+    // past base: distance to base disk / sides
+    const outside = Math.hypot(Math.max(radial, 0) * Math.min(rx, ry), pz - hz);
+    return radial > 0 ? outside : pz - hz;
+  }
+  // Inside the Z slab: cylindrical-ish distance to the tapering wall, plus slight end bias.
+  const wall = radial * Math.min(rx, ry);
+  return wall;
+}
+
+/** Triangular prism: base on y=-hy, ridge along z at y=+hy, x=0. */
+function sdWedge(px: number, py: number, pz: number, hx: number, hy: number, hz: number): number {
+  const dTri = sdTrianglePrismXY(px, py, hx, hy);
+  const dZ = Math.abs(pz) - hz;
+  return Math.min(Math.max(dTri, dZ), 0) + Math.hypot(Math.max(dTri, 0), Math.max(dZ, 0));
+}
+
+function sdTrianglePrismXY(px: number, py: number, hx: number, hy: number): number {
+  // Equilateral-ish isosceles triangle: (-hx,-hy), (hx,-hy), (0,hy)
+  const p1x = -hx, p1y = -hy;
+  const p2x = hx, p2y = -hy;
+  const p3x = 0, p3y = hy;
+  const e0x = p2x - p1x, e0y = p2y - p1y;
+  const e1x = p3x - p2x, e1y = p3y - p2y;
+  const e2x = p1x - p3x, e2y = p1y - p3y;
+  const v0x = px - p1x, v0y = py - p1y;
+  const v1x = px - p2x, v1y = py - p2y;
+  const v2x = px - p3x, v2y = py - p3y;
+  const dot00 = e0x * e0x + e0y * e0y;
+  const dot01 = e0x * v0x + e0y * v0y;
+  const dot11 = e1x * e1x + e1y * e1y;
+  const dot12 = e1x * v1x + e1y * v1y;
+  const dot22 = e2x * e2x + e2y * e2y;
+  const dot20 = e2x * v2x + e2y * v2y;
+  const pq0x = v0x - e0x * Math.min(Math.max(dot01 / dot00, 0), 1);
+  const pq0y = v0y - e0y * Math.min(Math.max(dot01 / dot00, 0), 1);
+  const pq1x = v1x - e1x * Math.min(Math.max(dot12 / dot11, 0), 1);
+  const pq1y = v1y - e1y * Math.min(Math.max(dot12 / dot11, 0), 1);
+  const pq2x = v2x - e2x * Math.min(Math.max(dot20 / dot22, 0), 1);
+  const pq2y = v2y - e2y * Math.min(Math.max(dot20 / dot22, 0), 1);
+  const s = Math.sign(e0x * e2y - e0y * e2x);
+  const d = Math.min(
+    pq0x * pq0x + pq0y * pq0y,
+    pq1x * pq1x + pq1y * pq1y,
+    pq2x * pq2x + pq2y * pq2y,
+  );
+  const s0 = s * (v0x * e0y - v0y * e0x);
+  const s1 = s * (v1x * e1y - v1y * e1x);
+  const s2 = s * (v2x * e2y - v2y * e2x);
+  return -Math.sqrt(d) * Math.sign(Math.min(s0, s1, s2));
+}
+
+function sdSemiDome(px: number, py: number, pz: number, hx: number, hy: number, hz: number): number {
+  // Half-ellipsoid above y=0 in local space (flat cut on the bottom).
+  const dEll = sdEllipsoid(px, py, pz, hx, hy, hz);
+  const dCut = -py; // outside below y=0
+  // Intersection: max(ellipsoid, half-space y>=0) but ellipsoid centered at origin —
+  // shift so flat sits on y=-hy bottom of AABB: use center at y=0 with only +Y half,
+  // extents hy upward. Caller centers primitive so flat is at bottom of cell.
+  return Math.max(dEll, dCut);
+}
+
+function evalPrimitive(x: number, y: number, z: number, p: HullPrimitive): number {
+  const px = x - p.cx;
+  const py = y - p.cy;
+  const pz = z - p.cz;
+  switch (p.kind) {
+    case "box":
+      return sdRoundBox(px, py, pz, p.hx, p.hy, p.hz, p.radius);
+    case "cone":
+      return sdCone(px, py, pz, p.hx, p.hy, p.hz);
+    case "wedge":
+      return sdWedge(px, py, pz, p.hx, p.hy, p.hz);
+    case "dome":
+      return sdEllipsoid(px, py, pz, p.hx, p.hy, p.hz);
+    case "semi":
+      return sdSemiDome(px, py, pz, p.hx, p.hy, p.hz);
+  }
+}
+
+function primitiveBounds(p: HullPrimitive): { minX: number; maxX: number; minY: number; maxY: number; minZ: number; maxZ: number } {
+  const pad = p.kind === "box" ? p.radius : 0;
+  return {
+    minX: p.cx - p.hx - pad,
+    maxX: p.cx + p.hx + pad,
+    minY: p.cy - p.hy - pad,
+    maxY: p.cy + p.hy + pad,
+    minZ: p.cz - p.hz - pad,
+    maxZ: p.cz + p.hz + pad,
+  };
 }
 
 /** Polynomial smooth-min — k is the fillet / "sleekness" width. */
@@ -40,16 +142,12 @@ function smin(a: number, b: number, k: number): number {
   return Math.min(a, b) - h * h * k * 0.25;
 }
 
-function sampleSdf(x: number, y: number, z: number, boxes: HullBox[], k: number): number {
+function sampleSdf(x: number, y: number, z: number, prims: HullPrimitive[], k: number): number {
   let d = Infinity;
-  for (const b of boxes) {
-    const bd = sdRoundBox(x - b.cx, y - b.cy, z - b.cz, b.hx, b.hy, b.hz, b.radius);
-    d = smin(d, bd, k);
-  }
+  for (const p of prims) d = smin(d, evalPrimitive(x, y, z, p), k);
   return d;
 }
 
-// Cube corner offsets and edge endpoint indices (Paul Bourke / Cory Bloyd).
 const CORNER: readonly (readonly [number, number, number])[] = [
   [0, 0, 0], [1, 0, 0], [1, 1, 0], [0, 1, 0],
   [0, 0, 1], [1, 0, 1], [1, 1, 1], [0, 1, 1],
@@ -61,14 +159,14 @@ const EDGE_VERT: readonly (readonly [number, number])[] = [
 ];
 
 /**
- * Polygonize a smooth-union of rounded boxes via marching cubes.
- * Returns a non-indexed BufferGeometry with computed normals, or null if empty.
+ * Polygonize a smooth-union of hull primitives via marching cubes.
+ * Returns BufferGeometry with computed normals, or null if empty.
  */
 export function buildSdfHullGeometry(
-  boxes: HullBox[],
+  prims: HullPrimitive[],
   opts?: { smoothK?: number; samplesPerCell?: number; cellSize?: number; pad?: number },
 ): THREE.BufferGeometry | null {
-  if (boxes.length === 0) return null;
+  if (prims.length === 0) return null;
 
   const smoothK = opts?.smoothK ?? 1.1;
   const samplesPerCell = opts?.samplesPerCell ?? 3;
@@ -78,13 +176,11 @@ export function buildSdfHullGeometry(
 
   let minX = Infinity, minY = Infinity, minZ = Infinity;
   let maxX = -Infinity, maxY = -Infinity, maxZ = -Infinity;
-  for (const b of boxes) {
-    minX = Math.min(minX, b.cx - b.hx - b.radius);
-    maxX = Math.max(maxX, b.cx + b.hx + b.radius);
-    minY = Math.min(minY, b.cy - b.hy - b.radius);
-    maxY = Math.max(maxY, b.cy + b.hy + b.radius);
-    minZ = Math.min(minZ, b.cz - b.hz - b.radius);
-    maxZ = Math.max(maxZ, b.cz + b.hz + b.radius);
+  for (const p of prims) {
+    const b = primitiveBounds(p);
+    minX = Math.min(minX, b.minX); maxX = Math.max(maxX, b.maxX);
+    minY = Math.min(minY, b.minY); maxY = Math.max(maxY, b.maxY);
+    minZ = Math.min(minZ, b.minZ); maxZ = Math.max(maxZ, b.maxZ);
   }
   minX -= pad; maxX += pad;
   minY -= pad; maxY += pad;
@@ -93,7 +189,6 @@ export function buildSdfHullGeometry(
   const nx = Math.max(2, Math.ceil((maxX - minX) / step));
   const ny = Math.max(2, Math.ceil((maxY - minY) / step));
   const nz = Math.max(2, Math.ceil((maxZ - minZ) / step));
-  // Cap grid so a huge layout can't melt a phone — ~48³ is plenty for editor ships.
   const maxDim = 48;
   const scale = Math.max(nx, ny, nz) > maxDim ? maxDim / Math.max(nx, ny, nz) : 1;
   const rx = Math.max(2, Math.round(nx * scale));
@@ -110,7 +205,7 @@ export function buildSdfHullGeometry(
     for (let j = 0; j <= ry; j++) {
       const y = minY + j * dy;
       for (let i = 0; i <= rx; i++) {
-        field[idx(i, j, k)] = sampleSdf(minX + i * dx, y, z, boxes, smoothK);
+        field[idx(i, j, k)] = sampleSdf(minX + i * dx, y, z, prims, smoothK);
       }
     }
   }
@@ -160,14 +255,11 @@ export function buildSdfHullGeometry(
           if (edges & (1 << e)) verts[e] = lerpVert(i, j, k, e);
         }
 
-        // triTable is packed 16 entries per cube configuration (same as Three's export).
         const base = cubeindex << 4;
         for (let t = 0; triTable[base + t] !== -1; t += 3) {
           const a = verts[triTable[base + t]];
           const b = verts[triTable[base + t + 1]];
           const c = verts[triTable[base + t + 2]];
-          // Bourke tables wind for density-field "inside"; our SDF (neg = inside) needs
-          // the opposite order or FrontSide culling shows the interior (x-ray look).
           indices.push(a, c, b);
         }
       }
@@ -182,3 +274,6 @@ export function buildSdfHullGeometry(
   geo.computeVertexNormals();
   return geo;
 }
+
+/** @deprecated Use HullPrimitive — kept as alias for box-only call sites. */
+export type HullBox = Extract<HullPrimitive, { kind: "box" }>;
