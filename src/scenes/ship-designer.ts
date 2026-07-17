@@ -1055,23 +1055,20 @@ function setup(ctx: SceneContext): SceneInstance {
     const z0 = layers[0].z;
     const z1 = layers[layers.length - 1].z;
     const noseLen = 2.0 * CELL;
-    const sternLen = 0.7 * CELL;
+    // Rear face of the rearmost cells (+ skin). No stern point-taper — that pinched the
+    // fuselage off before the engines and left the nozzles floating in space.
+    const sternZ = z1 + CELL / 2 + pad * 0.35;
     const noseZ = z0 - noseLen;
-    const sternZ = z1 + sternLen;
     const samples = Math.max(24, Math.ceil(((sternZ - noseZ) / CELL) * 8));
 
     const profileAt = (wz: number): Layer & { n: number } => {
       const L = sampleLayer(THREE.MathUtils.clamp(wz, z0, z1));
-      // Ogive nose: circular-arc radius shrink over ~2 cells past the front.
+      // Ogive nose only — hold full cross-section through the engine layer to the rear face.
       let taper = 1;
       if (wz < z0) {
         const t = THREE.MathUtils.clamp(1 - (z0 - wz) / noseLen, 0, 1);
-        taper = Math.sqrt(Math.max(0, 1 - (1 - t) * (1 - t))); // ogive
-      } else if (wz > z1) {
-        const t = THREE.MathUtils.clamp(1 - (wz - z1) / sternLen, 0, 1);
-        taper = THREE.MathUtils.smoothstep(t, 0, 1);
+        taper = Math.sqrt(Math.max(0, 1 - (1 - t) * (1 - t)));
       }
-      // Squarer near the stern (engine blocks), rounder toward the nose.
       const along = THREE.MathUtils.clamp((wz - noseZ) / Math.max(1e-6, sternZ - noseZ), 0, 1);
       const n = THREE.MathUtils.lerp(2.05, 3.2, along * along);
       return {
@@ -1111,16 +1108,18 @@ function setup(ctx: SceneContext): SceneInstance {
       }
     }
 
+    // Nose tip + flat stern cap (full rear ring, so nozzles can seat flush).
     const noseTip = positions.length / 3;
     positions.push(rings[0].cx, rings[0].cy, noseZ - CELL * 0.08);
-    const sternTip = positions.length / 3;
-    positions.push(rings[samples].cx, rings[samples].cy, sternZ + CELL * 0.08);
+    const sternCap = positions.length / 3;
+    const last = rings[samples];
+    positions.push(last.cx, last.cy, sternZ);
     for (let s = 0; s < segs; s++) {
       const s2 = (s + 1) % segs;
       indices.push(noseTip, s, s2);
       const a = samples * segs + s;
       const b = samples * segs + s2;
-      indices.push(sternTip, b, a);
+      indices.push(sternCap, b, a);
     }
 
     const geo = new THREE.BufferGeometry();
@@ -1129,7 +1128,8 @@ function setup(ctx: SceneContext): SceneInstance {
     geo.computeVertexNormals();
     hullGroup.add(new THREE.Mesh(geo, hullMaterial));
 
-    addEngineNozzles((m) => cellZ(m.z + m.dz - 1) + CELL / 2 + pad * 0.5);
+    // Seat nozzles on the flat rear face so they read as attached exhausts.
+    addEngineNozzles(() => sternZ);
   }
   // The original single-shell alternative, kept for comparison: an inflated
   // box over the installed modules' bounding volume with a cone nose.
