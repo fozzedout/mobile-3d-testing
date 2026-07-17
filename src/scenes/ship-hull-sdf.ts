@@ -166,8 +166,9 @@ export function buildSdfHullGeometry(
           const a = verts[triTable[base + t]];
           const b = verts[triTable[base + t + 1]];
           const c = verts[triTable[base + t + 2]];
-          // SDF negative = inside; Bourke winding faces outward for that convention.
-          indices.push(a, b, c);
+          // Bourke tables wind for density-field "inside"; our SDF (neg = inside) needs
+          // the opposite order or FrontSide culling shows the interior (x-ray look).
+          indices.push(a, c, b);
         }
       }
     }
