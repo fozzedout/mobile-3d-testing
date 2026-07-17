@@ -262,6 +262,18 @@ export class FlightRig {
     this.rollSlider.setBounds(top, height);
   }
 
+  /**
+   * How hard the player is commanding translation right now, in [0..1]: the
+   * larger of the move stick's deflection magnitude and the absolute vertical
+   * (ascend/descend) input, reading whichever aux-input mode is active. Lets a
+   * scene detect deliberate thrust — e.g. to release a docking clamp — from the
+   * same fields update() consumes, without duplicating the input plumbing.
+   */
+  get translationInput(): number {
+    const vertical = this.params.auxInput === "sliders" ? this.verticalSlider.value : this.fingerVerticalInput;
+    return Math.max(Math.hypot(this.moveStick.value.x, this.moveStick.value.y), Math.abs(vertical));
+  }
+
   reset(position: THREE.Vector3Tuple = [0, 0, 0], quaternion?: THREE.Quaternion): void {
     this.position.set(...position);
     this.quaternion.copy(quaternion ?? new THREE.Quaternion());

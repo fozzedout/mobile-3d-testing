@@ -73,6 +73,8 @@ const _relVel = new THREE.Vector3(); // reused: world relVel, then rotated into 
 const _bestNormal = new THREE.Vector3();
 const _worldNormal = new THREE.Vector3();
 const _targetWorld = new THREE.Vector3();
+const _frameQuat = new THREE.Quaternion(); // per-frame drum delta, used to co-rotate the docked view
+const _spinAxis = new THREE.Vector3(0, 0, 1); // world +Z: the station's only rotation axis (never mutated)
 
 function cellKey(x: number, y: number, z: number): string {
   return `${x},${y},${z}`;
@@ -219,6 +221,12 @@ function setup(ctx: SceneContext): SceneInstance {
   let phase: Phase = "approach";
   let landHold = 0;
   let invulnerable = 0;
+  // Docking clamp: while attached the ship is welded into the rotating station
+  // frame. seatLocal is its fixed station-LOCAL resting point, captured once at
+  // touchdown; the world pose is regenerated from it each frame, so the ship
+  // cannot drift off the pad however long it stays docked.
+  let attached = false;
+  const seatLocal = new THREE.Vector3();
   const phaseReadout = { phase: PHASE_LABEL.approach };
 
   function restart(): void {
@@ -230,6 +238,8 @@ function setup(ctx: SceneContext): SceneInstance {
     phaseReadout.phase = PHASE_LABEL.approach;
     landHold = 0;
     invulnerable = 0;
+    attached = false;
+    seatLocal.set(0, 0, 0);
     timer.restart();
   }
 
@@ -326,6 +336,21 @@ function setup(ctx: SceneContext): SceneInstance {
       // already moving when racing starts.
       stationGroup.rotation.z += SPIN * delta;
 
+      // Docked: sweep the ship with the drum. The drum orientation was just
+      // advanced above, so regenerating the world pose from the stored local
+      // seat keeps the ship locked to the pad with zero drift accumulation.
+      // The view co-rotates by the same frame delta (world +Z) so the bay looks
+      // stationary while the stars wheel past the slot — the frame switch made
+      // visible — with the player's own look (rig.update, already applied) on
+      // top. Velocity is slaved to the pad point's ω × r so the HUD drift reads
+      // exactly 0 and a later release inherits the right tangential velocity.
+      if (attached) {
+        rig.position.copy(seatLocal).applyQuaternion(stationGroup.quaternion);
+        _frameQuat.setFromAxisAngle(_spinAxis, SPIN * delta);
+        rig.quaternion.premultiply(_frameQuat);
+        rig.velocity.set(-SPIN * rig.position.y, SPIN * rig.position.x, 0);
+      }
+
       // World -> station-local for this frame (pure inverse rotation).
       _invQuat.copy(stationGroup.quaternion).invert();
       _local.copy(rig.position).applyQuaternion(_invQuat);
@@ -334,18 +359,29 @@ function setup(ctx: SceneContext): SceneInstance {
         Math.abs(_local.x) < CAVITY_HALF && Math.abs(_local.y) < CAVITY_HALF && Math.abs(_local.z) < CAVITY_HALF;
 
       if (timer.state === "racing") {
-        checkCollisions();
+        // Release the clamp on deliberate translational input. Velocity is
+        // already the pad's tangential velocity (slaved above), so the ship
+        // simply keeps drifting with the rotation it was part of — no special
+        // casing — until the player flies it out; normal physics resume below.
+        if (attached && rig.translationInput > 0.3) attached = false;
 
-        // Spin-gravity: centripetal pseudo-gravity while inside the cavity,
-        // pointing AWAY from the spin axis (station local +Z). The outward unit
-        // vector is (x,y,0)/r and the magnitude is SPIN²·r, so in local coords
-        // the acceleration is simply SPIN²·(x, y, 0). Coriolis is deliberately
-        // omitted — a coarse approximation is plenty for a testbed. This
-        // presses a ship hovering over the pad (out at local -y) toward it.
-        if (insideCavity) {
-          _accel.set(_local.x, _local.y, 0).multiplyScalar(SPIN * SPIN);
-          _accel.applyQuaternion(stationGroup.quaternion); // local -> world
-          rig.velocity.addScaledVector(_accel, delta);
+        // Seated ship: the stored seat is authoritative, so collision penalties
+        // and spin-gravity are skipped while attached.
+        if (!attached) {
+          checkCollisions();
+
+          // Spin-gravity: centripetal pseudo-gravity while inside the cavity,
+          // pointing AWAY from the spin axis (station local +Z). The outward
+          // unit vector is (x,y,0)/r and the magnitude is SPIN²·r, so in local
+          // coords the acceleration is simply SPIN²·(x, y, 0). Coriolis is
+          // deliberately omitted — a coarse approximation is plenty for a
+          // testbed. This presses a ship hovering over the pad (out at local
+          // -y) toward it.
+          if (insideCavity) {
+            _accel.set(_local.x, _local.y, 0).multiplyScalar(SPIN * SPIN);
+            _accel.applyQuaternion(stationGroup.quaternion); // local -> world
+            rig.velocity.addScaledVector(_accel, delta);
+          }
         }
 
         // Landing check: over the pad footprint, low, and slow RELATIVE to the
@@ -370,12 +406,25 @@ function setup(ctx: SceneContext): SceneInstance {
             if (insideCavity) phase = "land";
             break;
           case "land":
-            if (landed) {
+            // Clamp into the rotating frame the instant the landing check
+            // passes AND the player isn't commanding thrust (input <= 0.3 —
+            // the mirror of the release gate, so the two can never fight). The
+            // snap: inherit the pad point's world velocity, and store the seat
+            // at the current local x/z but a fixed local y one ship-radius
+            // above the pad surface plus a 0.2 epsilon, so the (skipped)
+            // collision test would never graze the pad cells.
+            if (landed && !attached && rig.translationInput <= 0.3) {
+              attached = true;
+              rig.velocity.copy(_padVel);
+              seatLocal.set(_local.x, PAD_SURFACE_Y + SHIP_RADIUS + 0.2, _local.z);
+              rig.position.copy(seatLocal).applyQuaternion(stationGroup.quaternion);
+            }
+            if (attached) {
               landHold += delta;
-              timer.statusText = `Touchdown — hold ${Math.max(0, HOLD_SECONDS - landHold).toFixed(1)}s`;
+              timer.statusText = "Touchdown — clamps engaged…";
               if (landHold >= HOLD_SECONDS) phase = "depart";
             } else {
-              landHold = 0; // leaving the pad (or coming in hot) resets the hold
+              landHold = 0; // leaving the pad (or coming in hot / thrusting) resets the hold
               timer.statusText = "In the bay — settle onto the green pad";
             }
             break;
