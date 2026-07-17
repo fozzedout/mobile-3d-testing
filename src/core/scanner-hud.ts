@@ -47,6 +47,10 @@ export class ScannerHUD {
     this.ctx.scale(ratio, ratio);
   }
 
+  setVisible(visible: boolean): void {
+    this.canvas.style.display = visible ? "block" : "none";
+  }
+
   update(shipPosition: THREE.Vector3, shipQuaternion: THREE.Quaternion, targets: ScannerTarget[]): void {
     const { ctx, width, diameter, range } = this;
     const cx = width / 2;

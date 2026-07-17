@@ -1,6 +1,7 @@
 import * as THREE from "three";
 import type { SceneContext, SceneInstance, TestScene } from "./types.ts";
 import { ScannerHUD } from "../core/scanner-hud.ts";
+import { LandingHUD } from "../core/landing-hud.ts";
 import { FlightRig } from "../core/flight-rig.ts";
 import { CourseTimer } from "../core/course-timer.ts";
 import { HitFlash } from "../core/hit-flash.ts";
@@ -38,6 +39,7 @@ const PAD_Z_MAX = HALF;
 const PAD_CEIL = PAD_SURFACE_Y + SHIP_RADIUS + 2; // must be hovering low over the pad
 const PAD_FLOOR = PAD_SURFACE_Y - 0.5;
 const LAND_SPEED = 4; // relative to the (rotating) pad, u/s
+const HOLD_SECONDS = 1.5; // touchdown hold before the dock counts
 
 // Aim points, station-local. Both are transformed by the station's live
 // orientation each frame, so the scanner tracks them as the drum turns. The
@@ -67,7 +69,7 @@ const _invQuat = new THREE.Quaternion();
 const _local = new THREE.Vector3();
 const _accel = new THREE.Vector3();
 const _padVel = new THREE.Vector3();
-const _relVel = new THREE.Vector3();
+const _relVel = new THREE.Vector3(); // reused: world relVel, then rotated into station-local for the HUD
 const _bestNormal = new THREE.Vector3();
 const _worldNormal = new THREE.Vector3();
 const _targetWorld = new THREE.Vector3();
@@ -159,6 +161,18 @@ function setup(ctx: SceneContext): SceneInstance {
   pad.position.set(PAD_LOCAL.x, PAD_SURFACE_Y + 0.4, PAD_LOCAL.z);
   stationGroup.add(pad);
 
+  // Touchdown projection marker — a flat emissive ring lying just above the pad
+  // plane, parented to stationGroup so it rotates with the drum. Each frame it's
+  // moved under the ship's local x/z (clamped to the cavity so it never sinks
+  // into a wall) to answer "where would I set down right now". Shown only while
+  // landing/departing and inside the cavity.
+  const markerGeometry = new THREE.RingGeometry(1.8, 2.5, 24);
+  const markerMaterial = new THREE.MeshBasicMaterial({ color: "#22c55e", transparent: true, opacity: 0.85, side: THREE.DoubleSide });
+  const marker = new THREE.Mesh(markerGeometry, markerMaterial);
+  marker.rotation.x = -Math.PI / 2; // RingGeometry is XY by default; lay it flat on the XZ pad plane
+  marker.visible = false;
+  stationGroup.add(marker);
+
   // Two light strips framing the slot on the outer +Z face (green left / red
   // right), so the slot's rotation is legible from the approach distance.
   const stripGeometry = new THREE.BoxGeometry(2, VOXEL, 2);
@@ -198,6 +212,7 @@ function setup(ctx: SceneContext): SceneInstance {
   camera.quaternion.copy(rig.quaternion);
 
   const scanner = new ScannerHUD(150, 240);
+  const landingHud = new LandingHUD();
   const timer = new CourseTimer({ storageKey: "course-best:docking-bay" });
   const hitFlash = new HitFlash();
 
@@ -357,8 +372,8 @@ function setup(ctx: SceneContext): SceneInstance {
           case "land":
             if (landed) {
               landHold += delta;
-              timer.statusText = `Touchdown — hold ${Math.max(0, 1.5 - landHold).toFixed(1)}s`;
-              if (landHold >= 1.5) phase = "depart";
+              timer.statusText = `Touchdown — hold ${Math.max(0, HOLD_SECONDS - landHold).toFixed(1)}s`;
+              if (landHold >= HOLD_SECONDS) phase = "depart";
             } else {
               landHold = 0; // leaving the pad (or coming in hot) resets the hold
               timer.statusText = "In the bay — settle onto the green pad";
@@ -383,21 +398,61 @@ function setup(ctx: SceneContext): SceneInstance {
       camera.quaternion.copy(rig.quaternion);
       shipLight.position.copy(rig.position);
 
-      // Scanner tracks the pad while landing, otherwise the slot — both carried
-      // into world space by the station's live orientation each frame.
-      const targetPad = phase === "land";
-      _targetWorld.copy(targetPad ? PAD_LOCAL : SLOT_LOCAL).applyQuaternion(stationGroup.quaternion);
-      scanner.update(rig.position, rig.quaternion, [
-        {
-          label: targetPad ? "Pad" : "Slot",
-          color: targetPad ? "#8fe3a0" : "#7fd4ff",
-          position: _targetWorld,
-        },
-      ]);
+      // Instrument swap: the scanner (approach/exit) gives way to the landing
+      // HUD (land/depart), so the two never overlap in the shared HUD slot.
+      const showLanding = phase === "land" || phase === "depart";
+      scanner.setVisible(!showLanding);
+      landingHud.setVisible(showLanding);
+
+      if (showLanding) {
+        // Everything the HUD draws lives in the PAD'S ROTATING LOCAL FRAME. The
+        // pad point's world velocity is ω × r; subtracting it and rotating the
+        // remainder into station-local axes factors the spin out, so a ship
+        // that is rotation-matched (world velocity == pad velocity) reads a
+        // near-zero drift even though it's physically sweeping through space.
+        _padVel.set(-SPIN * rig.position.y, SPIN * rig.position.x, 0);
+        _relVel.copy(rig.velocity).sub(_padVel).applyQuaternion(_invQuat); // world -> station-local
+        const overFoot =
+          _local.x >= PAD_X_MIN && _local.x <= PAD_X_MAX && _local.z >= PAD_Z_MIN && _local.z <= PAD_Z_MAX;
+        const inWindow = insideCavity && overFoot && _local.y <= PAD_CEIL && _local.y >= PAD_FLOOR;
+        landingHud.update({
+          lateralX: _local.x - PAD_LOCAL.x,
+          lateralZ: _local.z - PAD_LOCAL.z,
+          height: _local.y - PAD_SURFACE_Y - SHIP_RADIUS, // 0 = resting on the pad
+          relVelX: _relVel.x,
+          relVelZ: _relVel.z,
+          relVelY: _relVel.y, // negative = descending (local +y is up)
+          landSpeed: LAND_SPEED,
+          inWindow,
+          holdFrac: landHold / HOLD_SECONDS,
+        });
+
+        // In-world touchdown shadow: repositioned under the ship, clamped inside
+        // the cavity so it can't bleed into a wall, coloured by the same green/
+        // amber state as the HUD square. Only visible when inside the cavity.
+        const green = overFoot && _relVel.length() < LAND_SPEED;
+        markerMaterial.color.set(green ? "#22c55e" : "#f59e0b");
+        const clamp = CAVITY_HALF - 3;
+        marker.position.set(
+          THREE.MathUtils.clamp(_local.x, -clamp, clamp),
+          PAD_SURFACE_Y + 0.15,
+          THREE.MathUtils.clamp(_local.z, -clamp, clamp),
+        );
+        marker.visible = insideCavity;
+      } else {
+        marker.visible = false;
+        // Scanner tracks the rotating slot, carried into world space by the
+        // station's live orientation each frame.
+        _targetWorld.copy(SLOT_LOCAL).applyQuaternion(stationGroup.quaternion);
+        scanner.update(rig.position, rig.quaternion, [
+          { label: "Slot", color: "#7fd4ff", position: _targetWorld },
+        ]);
+      }
     },
     dispose() {
       rig.dispose();
       scanner.dispose();
+      landingHud.dispose();
       hitFlash.dispose();
 
       voxels.dispose();
@@ -405,6 +460,8 @@ function setup(ctx: SceneContext): SceneInstance {
       voxelMaterial.dispose();
       padGeometry.dispose();
       padMaterial.dispose();
+      markerGeometry.dispose();
+      markerMaterial.dispose();
       stripGeometry.dispose();
       greenStripMat.dispose();
       redStripMat.dispose();
