@@ -33,11 +33,11 @@ const FIGHTER_TURN_RATE_CAP = 140;
 const FIGHTER_MAX_BANK_DEG = 42; // purely cosmetic roll into turns, doesn't affect physics
 // Jousting pass ranges (hysteresis): inside BREAK it commits to extending past /
 // away; only once beyond REENGAGE does it turn back in for another attack run.
-// A single "min range → reverse" threshold used to strand it next to the player
-// trying a 180° turn while braked to a taxi crawl — nose guns can't lock from that.
+// REENGAGE is deliberately long so the inbound pass has time for several
+// nose-gun shots before it breaks off again.
 const FIGHTER_BREAK_RANGE = 55;
-const FIGHTER_REENGAGE_RANGE = 120;
-const FIGHTER_FIRE_RANGE = 150;
+const FIGHTER_REENGAGE_RANGE = 210;
+const FIGHTER_FIRE_RANGE = 240;
 // Guns are nose-mounted — it has to actually be pointed close to the player
 // to fire, unlike the saucer's omnidirectional turret.
 const FIGHTER_FIRE_ALIGNMENT_MIN = 0.85;
@@ -56,10 +56,11 @@ const FIGHTER_FIRE_COOLDOWN_SHRINK_PER_KILL = 0.05;
 const FIGHTER_FIRE_COOLDOWN_FLOOR = 0.6;
 const FIGHTER_AIM_INACCURACY_DEG = 9;
 const FIGHTER_LASER_SPEED = 150;
-const FIGHTER_LASER_LIFETIME = 1.6;
+// Lifetime sized so bolts from FIRE_RANGE still reach (240 / 150 ≈ 1.6s).
+const FIGHTER_LASER_LIFETIME = 1.8;
 const RESPAWN_DELAY = 1.8;
-const FIGHTER_SPAWN_MIN_DIST = 90;
-const FIGHTER_SPAWN_MAX_DIST = 160;
+const FIGHTER_SPAWN_MIN_DIST = 160;
+const FIGHTER_SPAWN_MAX_DIST = 240;
 const FIGHTER_HIT_GLOW_DECAY = 1 / 0.25; // per second
 
 interface Fighter {
