@@ -1,5 +1,7 @@
 import * as THREE from "three";
+import { RoomEnvironment } from "three/examples/jsm/environments/RoomEnvironment.js";
 import type { SceneContext, SceneInstance, TestScene } from "./types.ts";
+import { buildSdfHullGeometry, type HullBox } from "./ship-hull-sdf.ts";
 
 // One grid cell is 4 world units on a side. Space is an UNBOUNDED integer lattice:
 // cell (x,y,z) sits at world (x*CELL, y*CELL, z*CELL) and coords may go negative. There
@@ -17,7 +19,7 @@ type ModuleType = "reactor" | "engine" | "fuel" | "weapon" | "shield" | "cargo" 
 type ModuleSize = "S" | "M" | "L" | "XL";
 type ViewMode = "internal" | "exterior" | "performance";
 type PrefabName = "fighter" | "trader";
-type HullStyle = "plated" | "box";
+type HullStyle = "skinned" | "plated" | "box";
 
 const MODULE_TYPES: ModuleType[] = ["reactor", "engine", "fuel", "weapon", "shield", "cargo", "crew", "structure"];
 const MODULE_SIZES: ModuleSize[] = ["S", "M", "L", "XL"];
@@ -285,10 +287,11 @@ function makeIconTexture(type: ModuleType, size: ModuleSize): THREE.CanvasTextur
 }
 
 function setup(ctx: SceneContext): SceneInstance {
-  const { scene, gui, camera, controls, canvas } = ctx;
+  const { scene, gui, camera, controls, canvas, renderer } = ctx;
 
   const prevBackground = scene.background;
   const prevFog = scene.fog;
+  const prevEnvironment = scene.environment;
   scene.background = new THREE.Color("#0a0d14");
   // The shared scene carries a default near-range fog (far 30) sized for the
   // small demo scenes — this editor's camera orbits at ~50+ units, which
@@ -302,10 +305,17 @@ function setup(ctx: SceneContext): SceneInstance {
   const root = new THREE.Group();
   scene.add(root);
 
-  const ambient = new THREE.AmbientLight(0xffffff, 0.9);
-  const dirLight = new THREE.DirectionalLight(0xffffff, 1.6);
+  // Soft ambient + key light; env map carries most of the "sleek metal" specular.
+  const ambient = new THREE.AmbientLight(0xffffff, 0.35);
+  const dirLight = new THREE.DirectionalLight(0xffffff, 1.35);
   dirLight.position.set(20, 30, 10);
-  scene.add(ambient, dirLight);
+  const fillLight = new THREE.DirectionalLight(0xa8c4ff, 0.35);
+  fillLight.position.set(-18, 8, -12);
+  scene.add(ambient, dirLight, fillLight);
+
+  const pmrem = new THREE.PMREMGenerator(renderer);
+  const envMap = pmrem.fromScene(new RoomEnvironment(), 0.04).texture;
+  scene.environment = envMap;
 
   // One box geometry per FOOTPRINT DIMS triple (dims, not size, because rotation gives a
   // module a footprint its size's default doesn't have), shared across every module of
@@ -334,8 +344,46 @@ function setup(ctx: SceneContext): SceneInstance {
   const iconDataURL = (type: ModuleType, size: ModuleSize): string =>
     (iconTextures.get(iconKey(type, size))!.image as HTMLCanvasElement).toDataURL();
 
-  const hullMaterial = new THREE.MeshStandardMaterial({ color: "#5a6b8c", metalness: 0.35, roughness: 0.45 });
-  const nozzleMaterial = new THREE.MeshStandardMaterial({ color: "#2b2f38", metalness: 0.5, roughness: 0.5 });
+  // Subtle panel lines — same canvas bake path as module icons — keep the shell from
+  // reading as a featureless balloon once clearcoat + env reflections kick in.
+  const hullPanelMap = (() => {
+    const canvasEl = document.createElement("canvas");
+    canvasEl.width = 256;
+    canvasEl.height = 256;
+    const g = canvasEl.getContext("2d") as CanvasRenderingContext2D;
+    g.fillStyle = "#ffffff";
+    g.fillRect(0, 0, 256, 256);
+    g.strokeStyle = "rgba(0,0,0,0.18)";
+    g.lineWidth = 2;
+    for (let i = 0; i <= 8; i++) {
+      const p = (i / 8) * 256;
+      g.beginPath(); g.moveTo(p, 0); g.lineTo(p, 256); g.stroke();
+      g.beginPath(); g.moveTo(0, p); g.lineTo(256, p); g.stroke();
+    }
+    g.strokeStyle = "rgba(0,0,0,0.08)";
+    g.lineWidth = 1;
+    for (let i = 0; i < 8; i++) {
+      const p = (i + 0.5) / 8 * 256;
+      g.beginPath(); g.moveTo(p, 0); g.lineTo(p, 256); g.stroke();
+    }
+    const tex = new THREE.CanvasTexture(canvasEl);
+    tex.wrapS = tex.wrapT = THREE.RepeatWrapping;
+    tex.repeat.set(3, 2);
+    tex.colorSpace = THREE.NoColorSpace;
+    return tex;
+  })();
+
+  const hullMaterial = new THREE.MeshPhysicalMaterial({
+    color: "#5a6b8c",
+    metalness: 0.85,
+    roughness: 0.28,
+    clearcoat: 1.0,
+    clearcoatRoughness: 0.18,
+    envMap,
+    envMapIntensity: 1.15,
+    roughnessMap: hullPanelMap,
+  });
+  const nozzleMaterial = new THREE.MeshStandardMaterial({ color: "#2b2f38", metalness: 0.5, roughness: 0.5, envMap, envMapIntensity: 0.6 });
 
   const moduleGroup = new THREE.Group();
   const hullGroup = new THREE.Group();
@@ -352,7 +400,7 @@ function setup(ctx: SceneContext): SceneInstance {
     prefab: "fighter" as PrefabName,
     paletteSize: "S" as ModuleSize,
     hullColor: "#5a6b8c",
-    hullStyle: "plated" as HullStyle,
+    hullStyle: "skinned" as HullStyle,
   };
   const readout = { status: "OK — layout valid" };
   const perf = {
@@ -759,15 +807,41 @@ function setup(ctx: SceneContext): SceneInstance {
   function buildHull(): void {
     disposeHullMeshes();
     if (modules.length === 0) return;
-    if (state.hullStyle === "plated") buildPlatedHull();
+    if (state.hullStyle === "skinned") buildSkinnedHull();
+    else if (state.hullStyle === "plated") buildPlatedHull();
     else buildBoxHull();
   }
-  // Smoothed cover: loft elliptical cross-sections along Z from the occupied layout,
-  // with a blur so abrupt module steps soften into a continuous fuselage. Structure
-  // fairings still matter — they widen/narrow local profiles before the blur.
+
+  // SDF smooth-union of rounded module boxes → marching cubes. Follows nacelles /
+  // wings / asymmetric layouts; k is the fillet width ("sleekness").
+  function buildSkinnedHull(): void {
+    const boxes: HullBox[] = [];
+    const skin = 0.22 * CELL; // cover thickness outside the module footprint
+    const round = 0.38 * CELL;
+    for (const m of modules) {
+      const c = footprintCenter(m.x, m.y, m.z, m.dx, m.dy, m.dz);
+      boxes.push({
+        cx: c.x, cy: c.y, cz: c.z,
+        hx: (m.dx * CELL) / 2 + skin,
+        hy: (m.dy * CELL) / 2 + skin,
+        hz: (m.dz * CELL) / 2 + skin,
+        radius: round,
+      });
+    }
+    const geo = buildSdfHullGeometry(boxes, {
+      smoothK: 1.25 * CELL * 0.35, // ~1.25 world units of fillet between modules
+      samplesPerCell: 3.5,
+      cellSize: CELL,
+      pad: CELL * 1.1,
+    });
+    if (geo) hullGroup.add(new THREE.Mesh(geo, hullMaterial));
+    addEngineNozzles((m) => cellZ(m.z + m.dz - 1) + CELL / 2 + skin);
+  }
+
+  // Lofted fuselage (kept as a lighter alternative): Catmull-Rom profiles + ogive nose.
+  // Still one body per Z — asymmetric nacelles belong on "skinned".
   function buildPlatedHull(): void {
-    type Layer = { cx: number; cy: number; rx: number; ry: number };
-    const layers = new Map<number, Layer>();
+    type Layer = { z: number; cx: number; cy: number; rx: number; ry: number };
     const byZ = new Map<number, { minX: number; maxX: number; minY: number; maxY: number }>();
     for (const m of modules) {
       for (let ix = m.x; ix < m.x + m.dx; ix++) {
@@ -783,71 +857,88 @@ function setup(ctx: SceneContext): SceneInstance {
         }
       }
     }
-    for (const [iz, s] of byZ) {
-      layers.set(iz, {
+    const pad = 0.45 * CELL;
+    const layers: Layer[] = [...byZ.entries()]
+      .sort((a, b) => a[0] - b[0])
+      .map(([iz, s]) => ({
+        z: cellZ(iz),
         cx: cellX((s.minX + s.maxX) / 2),
         cy: cellY((s.minY + s.maxY) / 2),
-        rx: ((s.maxX - s.minX + 1) * CELL) / 2,
-        ry: ((s.maxY - s.minY + 1) * CELL) / 2,
-      });
-    }
+        rx: ((s.maxX - s.minX + 1) * CELL) / 2 + pad,
+        ry: ((s.maxY - s.minY + 1) * CELL) / 2 + pad,
+      }));
+    if (layers.length === 0) return;
 
-    const zs = [...layers.keys()].sort((a, b) => a - b);
-    if (zs.length === 0) return;
+    const catmull = (p0: number, p1: number, p2: number, p3: number, t: number): number =>
+      0.5 * ((2 * p1) + (-p0 + p2) * t + (2 * p0 - 5 * p1 + 4 * p2 - p3) * t * t + (-p0 + 3 * p1 - 3 * p2 + p3) * t * t * t);
 
-    const pad = 0.45 * CELL;
-    const blurCells = 1.15; // how far (in cells) the profile softens along Z
-    const segs = 28;
-    const z0 = zs[0];
-    const z1 = zs[zs.length - 1];
-    // Sample past the ends so the shell tapers into a nose / stern instead of flat caps.
-    const noseZ = cellZ(z0) - CELL * 0.95;
-    const sternZ = cellZ(z1) + CELL * 0.55;
-    const samples = Math.max(16, Math.ceil(((sternZ - noseZ) / CELL) * 6));
-
-    const rawAt = (wz: number): Layer => {
-      // Soft footprint at world-z: weighted contribution from nearby cell layers.
-      let wSum = 0, cx = 0, cy = 0, rx = 0, ry = 0;
-      for (const iz of zs) {
-        const layerZ = cellZ(iz);
-        const d = Math.abs(wz - layerZ) / CELL;
-        const w = Math.max(0, 1 - d / blurCells);
-        if (w <= 0) continue;
-        const L = layers.get(iz)!;
-        wSum += w;
-        cx += L.cx * w;
-        cy += L.cy * w;
-        rx += (L.rx + pad) * w;
-        ry += (L.ry + pad) * w;
-      }
-      if (wSum <= 1e-6) return { cx: 0, cy: 0, rx: pad * 0.4, ry: pad * 0.4 };
-      return { cx: cx / wSum, cy: cy / wSum, rx: rx / wSum, ry: ry / wSum };
+    const sampleLayer = (wz: number): Layer => {
+      if (layers.length === 1) return { ...layers[0], z: wz };
+      // Find segment; extrapolate with endpoint clones for Catmull-Rom.
+      let i = 0;
+      while (i < layers.length - 2 && wz > layers[i + 1].z) i++;
+      const l0 = layers[Math.max(0, i - 1)];
+      const l1 = layers[i];
+      const l2 = layers[Math.min(layers.length - 1, i + 1)];
+      const l3 = layers[Math.min(layers.length - 1, i + 2)];
+      const span = Math.max(1e-6, l2.z - l1.z);
+      const t = THREE.MathUtils.clamp((wz - l1.z) / span, 0, 1);
+      // Smoothstep the parameter so segment joins stay C1-ish.
+      const ts = t * t * (3 - 2 * t);
+      return {
+        z: wz,
+        cx: catmull(l0.cx, l1.cx, l2.cx, l3.cx, ts),
+        cy: catmull(l0.cy, l1.cy, l2.cy, l3.cy, ts),
+        rx: Math.max(pad * 0.35, catmull(l0.rx, l1.rx, l2.rx, l3.rx, ts)),
+        ry: Math.max(pad * 0.3, catmull(l0.ry, l1.ry, l2.ry, l3.ry, ts)),
+      };
     };
 
-    const profileAt = (wz: number): Layer => {
-      const L = rawAt(wz);
-      // Nose / stern taper toward a point so the cover reads as a hull, not a tube.
-      const noseT = THREE.MathUtils.clamp((wz - noseZ) / (CELL * 0.95), 0, 1);
-      const sternT = THREE.MathUtils.clamp((sternZ - wz) / (CELL * 0.55), 0, 1);
-      const taper = Math.min(1, Math.pow(noseT, 0.65) * Math.pow(sternT, 0.5));
-      return { cx: L.cx, cy: L.cy, rx: Math.max(pad * 0.25, L.rx * taper), ry: Math.max(pad * 0.2, L.ry * taper) };
+    const segs = 48;
+    const z0 = layers[0].z;
+    const z1 = layers[layers.length - 1].z;
+    const noseLen = 2.0 * CELL;
+    const sternLen = 0.7 * CELL;
+    const noseZ = z0 - noseLen;
+    const sternZ = z1 + sternLen;
+    const samples = Math.max(24, Math.ceil(((sternZ - noseZ) / CELL) * 8));
+
+    const profileAt = (wz: number): Layer & { n: number } => {
+      const L = sampleLayer(THREE.MathUtils.clamp(wz, z0, z1));
+      // Ogive nose: circular-arc radius shrink over ~2 cells past the front.
+      let taper = 1;
+      if (wz < z0) {
+        const t = THREE.MathUtils.clamp(1 - (z0 - wz) / noseLen, 0, 1);
+        taper = Math.sqrt(Math.max(0, 1 - (1 - t) * (1 - t))); // ogive
+      } else if (wz > z1) {
+        const t = THREE.MathUtils.clamp(1 - (wz - z1) / sternLen, 0, 1);
+        taper = THREE.MathUtils.smoothstep(t, 0, 1);
+      }
+      // Squarer near the stern (engine blocks), rounder toward the nose.
+      const along = THREE.MathUtils.clamp((wz - noseZ) / Math.max(1e-6, sternZ - noseZ), 0, 1);
+      const n = THREE.MathUtils.lerp(2.05, 3.2, along * along);
+      return {
+        z: wz,
+        cx: L.cx,
+        cy: L.cy,
+        rx: Math.max(pad * 0.2, L.rx * taper),
+        ry: Math.max(pad * 0.16, L.ry * taper),
+        n,
+      };
     };
 
     const positions: number[] = [];
     const indices: number[] = [];
-    const rings: Layer[] = [];
+    const rings: (Layer & { n: number })[] = [];
     for (let i = 0; i <= samples; i++) {
-      const t = i / samples;
-      const wz = noseZ + (sternZ - noseZ) * t;
-      rings.push(profileAt(wz));
-      const R = rings[i];
+      const wz = noseZ + (sternZ - noseZ) * (i / samples);
+      const R = profileAt(wz);
+      rings.push(R);
       for (let s = 0; s < segs; s++) {
         const a = (s / segs) * Math.PI * 2;
-        // Superellipse (n≈2.4): rounded, slightly fuller than a pure ellipse — sleek cover.
-        const n = 2.4;
         const ca = Math.cos(a), sa = Math.sin(a);
-        const sx = Math.sign(ca) * Math.pow(Math.abs(ca), 2 / n);
-        const sy = Math.sign(sa) * Math.pow(Math.abs(sa), 2 / n);
+        const sx = Math.sign(ca) * Math.pow(Math.abs(ca), 2 / R.n);
+        const sy = Math.sign(sa) * Math.pow(Math.abs(sa), 2 / R.n);
         positions.push(R.cx + R.rx * sx, R.cy + R.ry * sy, wz);
       }
     }
@@ -863,11 +954,10 @@ function setup(ctx: SceneContext): SceneInstance {
       }
     }
 
-    // Tip caps (nose + stern) so the shell is closed.
     const noseTip = positions.length / 3;
-    positions.push(rings[0].cx, rings[0].cy, noseZ - CELL * 0.15);
+    positions.push(rings[0].cx, rings[0].cy, noseZ - CELL * 0.08);
     const sternTip = positions.length / 3;
-    positions.push(rings[samples].cx, rings[samples].cy, sternZ + CELL * 0.1);
+    positions.push(rings[samples].cx, rings[samples].cy, sternZ + CELL * 0.08);
     for (let s = 0; s < segs; s++) {
       const s2 = (s + 1) % segs;
       indices.push(noseTip, s, s2);
@@ -1413,7 +1503,7 @@ function setup(ctx: SceneContext): SceneInstance {
   gui.add(actions, "loadPrefab").name("Load prefab");
   const hullColorCtrl = gui.addColor(state, "hullColor").name("Hull color").onChange((v: string) => hullMaterial.color.set(v));
   gui
-    .add(state, "hullStyle", ["plated", "box"])
+    .add(state, "hullStyle", ["skinned", "plated", "box"])
     .name("Hull style")
     .onChange(() => {
       if (state.view === "exterior") buildHull();
@@ -1463,13 +1553,17 @@ function setup(ctx: SceneContext): SceneInstance {
 
       for (const g of moduleGeomCache.values()) g.dispose();
       for (const t of iconTextures.values()) t.dispose();
+      hullPanelMap.dispose();
       hullMaterial.dispose();
       nozzleMaterial.dispose();
+      envMap.dispose();
+      pmrem.dispose();
 
-      scene.remove(root, ambient, dirLight);
+      scene.remove(root, ambient, dirLight, fillLight);
 
       scene.background = prevBackground;
       scene.fog = prevFog;
+      scene.environment = prevEnvironment;
       camera.position.set(3, 2, 4);
       camera.quaternion.identity();
       camera.updateProjectionMatrix();
