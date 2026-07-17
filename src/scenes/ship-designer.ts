@@ -1562,47 +1562,18 @@ function setup(ctx: SceneContext): SceneInstance {
   document.addEventListener("pointerup", onDocPointerUp);
   document.addEventListener("pointercancel", onDocPointerCancel);
 
-  // ---- touch UI: palette bar + selection action bar (DOM overlays) ------------------
+  // ---- touch UI: palette dock (fairing row + types) + selection action bar ------------
   function select(m: Module | null): void {
     selected = m;
     restyle();
     updateBars();
   }
 
-  // Palette: type icons (drag onto canvas) + size cycle. Structure fairing *shape* lives
-  // on the second menu above this bar.
-  const paletteBar = document.createElement("div");
-  paletteBar.className = "ship-palette";
-  const paletteButtons: { btn: HTMLButtonElement; type: ModuleType }[] = [];
-  for (const type of MODULE_TYPES) {
-    const btn = document.createElement("button");
-    btn.className = "ship-pal-btn";
-    btn.dataset.type = type;
-    btn.setAttribute("aria-label", `add ${type}`);
-    btn.addEventListener("pointerdown", (e) => onPaletteDown(e, type));
-    paletteBar.appendChild(btn);
-    paletteButtons.push({ btn, type });
-  }
-  const sizeBtn = document.createElement("button");
-  sizeBtn.className = "ship-pal-size";
-  sizeBtn.setAttribute("aria-label", "cycle module size");
-  sizeBtn.addEventListener("click", () => {
-    const i = (MODULE_SIZES.indexOf(state.paletteSize) + 1) % MODULE_SIZES.length;
-    state.paletteSize = MODULE_SIZES[i];
-    refreshPaletteIcons();
-  });
-  paletteBar.appendChild(sizeBtn);
-  // Trash hint: shown (via .ship-palette--trash) only while a module drag is live, so the
-  // bar reads as a "drop to remove" target. An overlaid child div is cleaner than juggling
-  // ::after content, and it's a child of paletteBar so paletteBar.remove() disposes it too.
-  const trashHint = document.createElement("div");
-  trashHint.className = "ship-palette-trash-hint";
-  trashHint.textContent = "Drop here to remove";
-  paletteBar.appendChild(trashHint);
-  document.body.appendChild(paletteBar);
+  // One dock so the fairing row can't hide independently of the type palette.
+  const dock = document.createElement("div");
+  dock.className = "ship-dock";
 
-  // Second menu: structure fairing shapes (block / cone / wedge / dome / semi). Selecting
-  // one sets the style used when you drag a structure block from the palette below.
+  // Fairing shapes (block / cone / wedge / dome / semi) — second menu above the types.
   const structureMenu = document.createElement("div");
   structureMenu.className = "ship-structure-menu";
   const structureMenuLabel = document.createElement("span");
@@ -1624,9 +1595,37 @@ function setup(ctx: SceneContext): SceneInstance {
     structureMenu.appendChild(btn);
     structureShapeButtons.push({ btn, shape });
   }
-  document.body.appendChild(structureMenu);
+  dock.appendChild(structureMenu);
 
-  // The palette bar doubles as a trash target during a module drag (see onDocPointerMove).
+  // Type icons (drag onto canvas) + size cycle.
+  const paletteBar = document.createElement("div");
+  paletteBar.className = "ship-palette";
+  const paletteButtons: { btn: HTMLButtonElement; type: ModuleType }[] = [];
+  for (const type of MODULE_TYPES) {
+    const btn = document.createElement("button");
+    btn.className = "ship-pal-btn";
+    btn.dataset.type = type;
+    btn.setAttribute("aria-label", `add ${type}`);
+    btn.addEventListener("pointerdown", (e) => onPaletteDown(e, type));
+    paletteBar.appendChild(btn);
+    paletteButtons.push({ btn, type });
+  }
+  const sizeBtn = document.createElement("button");
+  sizeBtn.className = "ship-pal-size";
+  sizeBtn.setAttribute("aria-label", "cycle module size");
+  sizeBtn.addEventListener("click", () => {
+    const i = (MODULE_SIZES.indexOf(state.paletteSize) + 1) % MODULE_SIZES.length;
+    state.paletteSize = MODULE_SIZES[i];
+    refreshPaletteIcons();
+  });
+  paletteBar.appendChild(sizeBtn);
+  const trashHint = document.createElement("div");
+  trashHint.className = "ship-palette-trash-hint";
+  trashHint.textContent = "Drop here to remove";
+  paletteBar.appendChild(trashHint);
+  dock.appendChild(paletteBar);
+  document.body.appendChild(dock);
+
   function pointerInPalette(clientX: number, clientY: number): boolean {
     const r = paletteBar.getBoundingClientRect();
     return clientX >= r.left && clientX <= r.right && clientY >= r.top && clientY <= r.bottom;
@@ -1667,7 +1666,7 @@ function setup(ctx: SceneContext): SceneInstance {
 
   // Action bar: shown only while a module is selected — rotate / duplicate / remove it.
   const actionBar = document.createElement("div");
-  actionBar.className = "ship-actions";
+  actionBar.className = "ship-actions ship-hidden";
   const actionLabel = document.createElement("span");
   actionLabel.className = "ship-actions-label";
   actionBar.appendChild(actionLabel);
@@ -1680,18 +1679,16 @@ function setup(ctx: SceneContext): SceneInstance {
     b.addEventListener("click", onClick);
     actionBar.appendChild(b);
   };
-  // Two rotation axes: yaw (vertical, swaps dx<->dz) and pitch (lateral, swaps dy<->dz).
   mkActionBtn("⟳ Y", "rotate-y", "rotate around vertical axis", () => rotateSelected("yaw"));
   mkActionBtn("⤴ X", "rotate-x", "rotate around lateral axis", () => rotateSelected("pitch"));
   mkActionBtn("⧉ Duplicate", "duplicate", "duplicate module", duplicateSelected);
   mkActionBtn("✕ Remove", "remove", "remove module", removeSelected);
   document.body.appendChild(actionBar);
 
-  // Palette + fairing menu hide in exterior; action bar also hides with no selection.
+  // Dock (fairing + types) hides in exterior; action bar also hides with no selection.
   function updateBars(): void {
     const editing = state.view !== "exterior";
-    paletteBar.classList.toggle("ship-hidden", !editing);
-    structureMenu.classList.toggle("ship-hidden", !editing);
+    dock.classList.toggle("ship-hidden", !editing);
     const showActions = editing && selected !== null;
     actionBar.classList.toggle("ship-hidden", !showActions);
     if (selected) actionLabel.textContent = selectionLabel(selected);
@@ -1743,8 +1740,7 @@ function setup(ctx: SceneContext): SceneInstance {
       document.removeEventListener("pointermove", onDocPointerMove);
       document.removeEventListener("pointerup", onDocPointerUp);
       document.removeEventListener("pointercancel", onDocPointerCancel);
-      paletteBar.remove();
-      structureMenu.remove();
+      dock.remove();
       actionBar.remove();
 
       // A palette ghost may be mid-flight (never registered in `modules`) — dispose it.

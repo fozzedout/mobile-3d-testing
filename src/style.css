@@ -388,15 +388,32 @@ body {
   }
 }
 
-/* Ship-designer touch UI: a bottom palette bar (always visible while editing) and a
-   selection action bar stacked just above it. Both sit below lil-gui (z-index 26),
-   are safe-area padded, and take their pointer events so drags/taps land on the bar. */
-.ship-palette {
+/* Ship-designer touch UI: a bottom dock (fairing shapes + type palette) and a
+   selection action bar stacked above it. */
+.ship-dock {
   position: fixed;
   left: 50%;
   bottom: calc(var(--safe-bottom) + 12px);
   transform: translateX(-50%);
   z-index: 26;
+  display: flex;
+  flex-direction: column-reverse;
+  align-items: center;
+  gap: 6px;
+  max-width: calc(100vw - 16px);
+  pointer-events: none;
+}
+
+.ship-dock > * {
+  pointer-events: auto;
+}
+
+.ship-palette {
+  position: relative;
+  left: auto;
+  bottom: auto;
+  transform: none;
+  z-index: auto;
   display: flex;
   align-items: center;
   gap: 6px;
@@ -406,7 +423,6 @@ body {
   border: 1px solid #2b2f3a;
   border-radius: 12px;
   backdrop-filter: blur(6px);
-  pointer-events: auto;
   /* The palette buttons initiate a drag — no browser scroll/zoom should steal it. */
   touch-action: none;
   overflow-x: auto;
@@ -446,13 +462,13 @@ body {
   background: #2b2f3a;
 }
 
-/* Structure fairing shape menu — sits above the type palette. */
+/* Structure fairing shape menu — top row of the dock (column-reverse puts types at bottom). */
 .ship-structure-menu {
-  position: fixed;
-  left: 50%;
-  bottom: calc(var(--safe-bottom) + 12px + 72px);
-  transform: translateX(-50%);
-  z-index: 26;
+  position: relative;
+  left: auto;
+  bottom: auto;
+  transform: none;
+  z-index: auto;
   display: flex;
   align-items: center;
   gap: 6px;
@@ -462,7 +478,6 @@ body {
   border: 1px solid #2b2f3a;
   border-radius: 12px;
   backdrop-filter: blur(6px);
-  pointer-events: auto;
   touch-action: none;
   overflow-x: auto;
   -webkit-overflow-scrolling: touch;
@@ -503,14 +518,12 @@ body {
 .ship-actions {
   position: fixed;
   left: 50%;
-  /* Above palette + fairing shape menu. */
-  bottom: calc(var(--safe-bottom) + 12px + 72px + 64px);
+  /* Above the two-row dock (~64 + 6 + 60). */
+  bottom: calc(var(--safe-bottom) + 12px + 140px);
   transform: translateX(-50%);
   z-index: 26;
   display: flex;
   align-items: center;
-  /* Tightened from 8px/10px so four buttons (2 rotate + duplicate + remove) plus the
-     label still fit a 390px viewport without shrinking the >=44px touch targets. */
   gap: 6px;
   max-width: calc(100vw - 16px);
   padding: 8px;
@@ -554,8 +567,7 @@ body {
 }
 
 /* ---- palette-as-trash target (active only during a module drag) ------------------- */
-/* The hint overlays the bar via position:absolute; the base .ship-palette is already
-   position:fixed, so it's the positioning context. */
+/* The hint overlays the type row via position:absolute; .ship-palette is position:relative. */
 .ship-palette--trash {
   border-color: #ff5d7a;
 }
