@@ -104,6 +104,10 @@ export class FlightRig {
   readonly position = new THREE.Vector3();
   readonly quaternion = new THREE.Quaternion();
   readonly velocity = new THREE.Vector3();
+  /** When false, update() stops steering velocity toward the input command
+   *  (including the hands-off brake) — an external force system owns velocity.
+   *  Scenes that clear this must restore it. */
+  assistBrake = true;
 
   readonly params = {
     scheme: "dual-stick" as Scheme,
@@ -532,7 +536,12 @@ export class FlightRig {
       .multiplyScalar(params.maxSpeed)
       .applyQuaternion(this.quaternion);
 
-    this.velocity.lerp(targetVelocity, 1 - Math.pow(0.001, delta));
+    // Flight assist: velocity chases the commanded velocity, which also brakes
+    // the ship toward a stop when hands-off. A scene whose own force system
+    // owns the ship's velocity for a while (e.g. a docking capture field) can
+    // suspend this — otherwise the assist out-muscles any plausible external
+    // force, and worse, does so frame-rate-dependently.
+    if (this.assistBrake) this.velocity.lerp(targetVelocity, 1 - Math.pow(0.001, delta));
     this.position.addScaledVector(this.velocity, delta);
     params.speed = Math.round(this.velocity.length());
   }

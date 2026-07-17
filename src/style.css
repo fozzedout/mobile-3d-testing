@@ -260,6 +260,16 @@ body {
   right: 0;
 }
 
+.target-pointer {
+  position: fixed;
+  inset: 0;
+  /* Above lil-gui's own z-index (1001), same layer as the flight reticle — the
+     pad cue must stay visible even when the GUI panel covers part of the view.
+     Stays pointer-events:none so it never intercepts GUI interaction. */
+  z-index: 1002;
+  pointer-events: none;
+}
+
 .edge-slider {
   position: fixed;
   top: 50%;

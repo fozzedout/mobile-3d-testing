@@ -2,6 +2,7 @@ import * as THREE from "three";
 import type { SceneContext, SceneInstance, TestScene } from "./types.ts";
 import { ScannerHUD } from "../core/scanner-hud.ts";
 import { LandingHUD } from "../core/landing-hud.ts";
+import { TargetPointer } from "../core/target-pointer.ts";
 import { FlightRig } from "../core/flight-rig.ts";
 import { CourseTimer } from "../core/course-timer.ts";
 import { HitFlash } from "../core/hit-flash.ts";
@@ -47,6 +48,26 @@ const HOLD_SECONDS = 1.5; // touchdown hold before the dock counts
 const SLOT_LOCAL = new THREE.Vector3(0, 0, (BOX_Z + 0.5) * VOXEL); // (0,0,35)
 const PAD_LOCAL = new THREE.Vector3(HALF, PAD_SURFACE_Y, -HALF); // (5,-25,-5)
 
+// Magnetic capture field over the pad. Real-device feedback: settling onto a
+// tight window blind (no read on whether the pad is above or below you) was
+// fiddly, so a slow, hands-off ship is instead caught by a soft funnel that
+// draws it to the seat and rights it — thrust always overrides the magnet.
+// SEAT_LOCAL is the ship-centre rest point over the pad centre (station-local).
+// Capture target: ship-centre rest point over the pad centre. The 0.6 clearance
+// keeps the whole snap window (SNAP_DIST) plus servo jitter above the pad
+// cells' collision threshold (SHIP_RADIUS off the surface), so the field can
+// never scrape you across your own landing pad while it reels you in.
+const SEAT_LOCAL = new THREE.Vector3(PAD_LOCAL.x, PAD_SURFACE_Y + SHIP_RADIUS + 0.6, PAD_LOCAL.z);
+const CAPTURE_RADIUS = 12;     // field reach from the seat point, world units
+const CAPTURE_SPEED = 8;       // max relative speed at which the field can grab
+const CAPTURE_PULL = 1;        // reel speed per unit of seat offset, 1/s
+const CAPTURE_REEL = 5;        // cap on the commanded approach speed, u/s
+const CAPTURE_GAIN = 3;        // how hard the field steers velocity onto the command, 1/s
+const CAPTURE_MAX_ACCEL = 15;  // clamp on field acceleration, u/s²
+const CAPTURE_ALIGN_RATE = 0.9; // rad/s — how fast the field rights the ship
+const SNAP_DIST = 0.7;         // within this of the seat...
+const SNAP_SPEED = 0.8;        // ...and this slow (relative) → clamps engage
+
 const CAVITY_HALF = (CAV + 0.5) * VOXEL; // 25 — cavity interior half-extent
 const OUTER_CLEAR_XY = (BOX_XY + 1.5) * VOXEL; // 55 — well past the outer shell
 const OUTER_CLEAR_Z = (BOX_Z + 1.5) * VOXEL; // 45
@@ -75,6 +96,14 @@ const _worldNormal = new THREE.Vector3();
 const _targetWorld = new THREE.Vector3();
 const _frameQuat = new THREE.Quaternion(); // per-frame drum delta, used to co-rotate the docked view
 const _spinAxis = new THREE.Vector3(0, 0, 1); // world +Z: the station's only rotation axis (never mutated)
+const _capOffset = new THREE.Vector3(); // SEAT_LOCAL − ship, station-local (its length is the world distance to the seat)
+const _seatWorld = new THREE.Vector3(); // SEAT_LOCAL carried into world by the drum's orientation
+const _padWorld = new THREE.Vector3(); // PAD_LOCAL carried into world, for the screen-space pointer
+const _capAccel = new THREE.Vector3(); // field spring-damper acceleration (world)
+const _shipUp = new THREE.Vector3(); // ship-local +Y in world
+const _padUp = new THREE.Vector3(); // pad (station-local) +Y in world
+const _alignQuat = new THREE.Quaternion(); // shortest arc ship-up → pad-up
+const _stepQuat = new THREE.Quaternion(); // that arc rate-limited to CAPTURE_ALIGN_RATE·delta
 
 function cellKey(x: number, y: number, z: number): string {
   return `${x},${y},${z}`;
@@ -175,6 +204,22 @@ function setup(ctx: SceneContext): SceneInstance {
   marker.visible = false;
   stationGroup.add(marker);
 
+  // Magnetic capture volume — a faint open green column standing over the pad,
+  // parented to stationGroup so it spins with the drum. It marks the reach of
+  // the field; it brightens and pulses while the field actually has the ship.
+  const captureColumnGeometry = new THREE.CylinderGeometry(CAPTURE_RADIUS, CAPTURE_RADIUS, CAPTURE_RADIUS * 1.6, 24, 1, true);
+  const captureColumnMaterial = new THREE.MeshBasicMaterial({
+    color: "#22c55e",
+    transparent: true,
+    opacity: 0.06,
+    side: THREE.DoubleSide,
+    depthWrite: false,
+  });
+  const captureColumn = new THREE.Mesh(captureColumnGeometry, captureColumnMaterial);
+  captureColumn.position.set(PAD_LOCAL.x, PAD_SURFACE_Y + CAPTURE_RADIUS * 0.8, PAD_LOCAL.z);
+  captureColumn.visible = false;
+  stationGroup.add(captureColumn);
+
   // Two light strips framing the slot on the outer +Z face (green left / red
   // right), so the slot's rotation is legible from the approach distance.
   const stripGeometry = new THREE.BoxGeometry(2, VOXEL, 2);
@@ -215,12 +260,17 @@ function setup(ctx: SceneContext): SceneInstance {
 
   const scanner = new ScannerHUD(150, 240);
   const landingHud = new LandingHUD();
+  const pointer = new TargetPointer();
   const timer = new CourseTimer({ storageKey: "course-best:docking-bay" });
   const hitFlash = new HitFlash();
 
   let phase: Phase = "approach";
   let landHold = 0;
   let invulnerable = 0;
+  let elapsed = 0; // running clock, only for the capture column's pulse
+  // Field has hold of a slow, hands-off ship and is drawing it to the seat, but
+  // the clamps haven't engaged yet — a soft, breakable state before `attached`.
+  let capturing = false;
   // Docking clamp: while attached the ship is welded into the rotating station
   // frame. seatLocal is its fixed station-LOCAL resting point, captured once at
   // touchdown; the world pose is regenerated from it each frame, so the ship
@@ -239,7 +289,11 @@ function setup(ctx: SceneContext): SceneInstance {
     landHold = 0;
     invulnerable = 0;
     attached = false;
+    capturing = false;
+    rig.assistBrake = true;
     seatLocal.set(0, 0, 0);
+    captureColumn.visible = false;
+    pointer.setVisible(false);
     timer.restart();
   }
 
@@ -330,6 +384,7 @@ function setup(ctx: SceneContext): SceneInstance {
     update(delta) {
       if (timer.state !== "countdown") rig.update(delta);
       timer.update(delta);
+      elapsed += delta;
       if (invulnerable > 0) invulnerable -= delta;
 
       // The drum spins continuously — during the countdown too, so the slot is
@@ -366,7 +421,11 @@ function setup(ctx: SceneContext): SceneInstance {
         if (attached && rig.translationInput > 0.3) attached = false;
 
         // Seated ship: the stored seat is authoritative, so collision penalties
-        // and spin-gravity are skipped while attached.
+        // and spin-gravity are skipped while attached. While merely `capturing`
+        // (not yet clamped) both stay ACTIVE — the field has to overpower
+        // spin-gravity, which it comfortably does: ω²r ≈ 0.15²·25 ≈ 0.6 u/s²,
+        // while the field's pull is clamped at 10 u/s² and near the seat the
+        // damping term pins the relative velocity, so 0.6 « 10 and the field wins.
         if (!attached) {
           checkCollisions();
 
@@ -384,21 +443,18 @@ function setup(ctx: SceneContext): SceneInstance {
           }
         }
 
-        // Landing check: over the pad footprint, low, and slow RELATIVE to the
-        // rotating pad. The pad point's world velocity is ω × r, with ω = the
+        // Relative velocity vs the rotating pad drives both the capture field and
+        // the HUD. The pad point's world velocity is ω × r, with ω = the
         // station's angular velocity (about world +Z, since spinning about Z
         // leaves the Z axis fixed) and r the ship's offset from the axis:
-        // (0,0,SPIN) × (x,y,0) = (-SPIN·y, SPIN·x, 0).
+        // (0,0,SPIN) × (x,y,0) = (-SPIN·y, SPIN·x, 0). _relVel holds the world
+        // relative velocity (ship − pad) through the switch; the showLanding
+        // block re-derives it into station-local afterwards.
         _padVel.set(-SPIN * rig.position.y, SPIN * rig.position.x, 0);
         const relSpeed = _relVel.copy(rig.velocity).sub(_padVel).length();
-        const overPad =
-          _local.x >= PAD_X_MIN &&
-          _local.x <= PAD_X_MAX &&
-          _local.z >= PAD_Z_MIN &&
-          _local.z <= PAD_Z_MAX &&
-          _local.y <= PAD_CEIL &&
-          _local.y >= PAD_FLOOR;
-        const landed = insideCavity && overPad && relSpeed < LAND_SPEED;
+        // Distance to the seat, station-local (rotation preserves length, so this
+        // is also the world distance).
+        const seatDist = _capOffset.copy(SEAT_LOCAL).sub(_local).length();
 
         switch (phase) {
           case "approach":
@@ -406,26 +462,65 @@ function setup(ctx: SceneContext): SceneInstance {
             if (insideCavity) phase = "land";
             break;
           case "land":
-            // Clamp into the rotating frame the instant the landing check
-            // passes AND the player isn't commanding thrust (input <= 0.3 —
-            // the mirror of the release gate, so the two can never fight). The
-            // snap: inherit the pad point's world velocity, and store the seat
-            // at the current local x/z but a fixed local y one ship-radius
-            // above the pad surface plus a 0.2 epsilon, so the (skipped)
-            // collision test would never graze the pad cells.
-            if (landed && !attached && rig.translationInput <= 0.3) {
-              attached = true;
-              rig.velocity.copy(_padVel);
-              seatLocal.set(_local.x, PAD_SURFACE_Y + SHIP_RADIUS + 0.2, _local.z);
-              rig.position.copy(seatLocal).applyQuaternion(stationGroup.quaternion);
+            if (!attached) {
+              // The field grabs a slow, hands-off ship inside its reach and lets
+              // go the instant thrust exceeds the deadband (the same gate that
+              // releases the clamps, so magnet and pilot never fight) or the ship
+              // is dragged/flies well outside the reach.
+              if (capturing) {
+                if (rig.translationInput > 0.3 || seatDist > CAPTURE_RADIUS * 1.5) capturing = false;
+              } else if (seatDist < CAPTURE_RADIUS && relSpeed < CAPTURE_SPEED && rig.translationInput <= 0.3) {
+                capturing = true;
+              }
+
+              if (capturing) {
+                // Velocity servo, not a raw spring: command an approach velocity
+                // toward the seat that tapers with distance (capped at
+                // CAPTURE_REEL) on top of the pad point's own ω × r, then steer
+                // the ship's velocity onto that command. A clamped spring-damper
+                // saturates its accel budget on the pull term at range, diluting
+                // the damping and orbiting the moving seat for tens of seconds;
+                // the servo's commanded velocity always points the error down,
+                // so it reels in monotonically (~1/CAPTURE_PULL s per e-fold).
+                _seatWorld.copy(SEAT_LOCAL).applyQuaternion(stationGroup.quaternion);
+                _capAccel.copy(_seatWorld).sub(rig.position);
+                const reel = Math.min(_capAccel.length() * CAPTURE_PULL, CAPTURE_REEL);
+                _capAccel.normalize().multiplyScalar(reel).add(_padVel).sub(rig.velocity);
+                _capAccel.multiplyScalar(CAPTURE_GAIN);
+                const am = _capAccel.length();
+                if (am > CAPTURE_MAX_ACCEL) _capAccel.multiplyScalar(CAPTURE_MAX_ACCEL / am);
+                rig.velocity.addScaledVector(_capAccel, delta);
+
+                // Right the ship: rotate its up axis toward the pad's up, rate-
+                // limited. rotateTowards caps the step at the actual arc, so a
+                // near-aligned ship (angle ≈ 0) just holds — no NaN, no snap.
+                _shipUp.set(0, 1, 0).applyQuaternion(rig.quaternion);
+                _padUp.set(0, 1, 0).applyQuaternion(stationGroup.quaternion);
+                _alignQuat.setFromUnitVectors(_shipUp, _padUp);
+                _stepQuat.identity().rotateTowards(_alignQuat, CAPTURE_ALIGN_RATE * delta);
+                rig.quaternion.premultiply(_stepQuat).normalize();
+
+                // Close and slow enough: hand off to the hard clamp. The field
+                // centres you on the seat (no more "wherever you touched down").
+                if (seatDist < SNAP_DIST && relSpeed < SNAP_SPEED) {
+                  attached = true;
+                  capturing = false;
+                  seatLocal.copy(SEAT_LOCAL);
+                  rig.velocity.copy(_padVel);
+                  rig.position.copy(seatLocal).applyQuaternion(stationGroup.quaternion);
+                }
+              }
             }
+
             if (attached) {
               landHold += delta;
               timer.statusText = "Touchdown — clamps engaged…";
               if (landHold >= HOLD_SECONDS) phase = "depart";
             } else {
-              landHold = 0; // leaving the pad (or coming in hot / thrusting) resets the hold
-              timer.statusText = "In the bay — settle onto the green pad";
+              landHold = 0; // only a hard clamp accrues the hold; capturing doesn't count
+              timer.statusText = capturing
+                ? "Magnetic capture — field has you"
+                : "In the bay — drift into the pad field";
             }
             break;
           case "depart":
@@ -441,6 +536,13 @@ function setup(ctx: SceneContext): SceneInstance {
             break;
         }
         phaseReadout.phase = PHASE_LABEL[phase];
+
+        // While the field holds the hull it owns the ship's velocity outright,
+        // so the rig's flight assist (which brakes hands-off velocity toward
+        // zero hard enough to out-muscle the field — and does so more strongly
+        // the lower the frame rate) is suspended for the duration. Takes effect
+        // in the next frame's rig.update, one frame after the state it mirrors.
+        rig.assistBrake = !capturing;
       }
 
       camera.position.copy(rig.position);
@@ -497,11 +599,33 @@ function setup(ctx: SceneContext): SceneInstance {
           { label: "Slot", color: "#7fd4ff", position: _targetWorld },
         ]);
       }
+
+      // Screen-space pad cue — answers "is the pad above or below me": an on-
+      // screen diamond when the pad is in view, an edge chevron pointing toward
+      // it otherwise. Only while landing/departing, and hidden once clamped (on
+      // the pad it's just noise).
+      const showPointer = showLanding && !attached;
+      pointer.setVisible(showPointer);
+      if (showPointer) {
+        _padWorld.copy(PAD_LOCAL).applyQuaternion(stationGroup.quaternion);
+        pointer.update(camera, _padWorld, "PAD");
+      }
+
+      // Capture-field column: shown over the pad through land/depart, hidden in
+      // other phases and once clamped. Faint at rest, a brighter pulse while the
+      // field actually has the ship.
+      if (showLanding && !attached) {
+        captureColumn.visible = true;
+        captureColumnMaterial.opacity = capturing ? 0.1 + 0.05 * Math.sin(elapsed * 4) : 0.06;
+      } else {
+        captureColumn.visible = false;
+      }
     },
     dispose() {
       rig.dispose();
       scanner.dispose();
       landingHud.dispose();
+      pointer.dispose();
       hitFlash.dispose();
 
       voxels.dispose();
@@ -511,6 +635,8 @@ function setup(ctx: SceneContext): SceneInstance {
       padMaterial.dispose();
       markerGeometry.dispose();
       markerMaterial.dispose();
+      captureColumnGeometry.dispose();
+      captureColumnMaterial.dispose();
       stripGeometry.dispose();
       greenStripMat.dispose();
       redStripMat.dispose();
