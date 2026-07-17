@@ -1115,8 +1115,8 @@ function setup(ctx: SceneContext): SceneInstance {
         const b = i * segs + s2;
         const c = (i + 1) * segs + s;
         const d = (i + 1) * segs + s2;
-        // Outward winding (rings go CCW when looking along -Z / toward the nose).
-        indices.push(a, c, b, b, c, d);
+        // Body sides were already outward — do not flip these.
+        indices.push(a, b, c, b, d, c);
       }
     }
 
@@ -1128,8 +1128,8 @@ function setup(ctx: SceneContext): SceneInstance {
     positions.push(last.cx, last.cy, sternZ);
     for (let s = 0; s < segs; s++) {
       const s2 = (s + 1) % segs;
-      // Nose cap faces -Z (outward); stern cap faces +Z (outward).
-      indices.push(noseTip, s2, s);
+      // Nose faces -Z (outward). Stern was the only flipped piece — face +Z (outward).
+      indices.push(noseTip, s, s2);
       const a = samples * segs + s;
       const b = samples * segs + s2;
       indices.push(sternCap, a, b);
