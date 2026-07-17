@@ -1115,7 +1115,8 @@ function setup(ctx: SceneContext): SceneInstance {
         const b = i * segs + s2;
         const c = (i + 1) * segs + s;
         const d = (i + 1) * segs + s2;
-        indices.push(a, b, c, b, d, c);
+        // Outward winding (rings go CCW when looking along -Z / toward the nose).
+        indices.push(a, c, b, b, c, d);
       }
     }
 
@@ -1127,10 +1128,11 @@ function setup(ctx: SceneContext): SceneInstance {
     positions.push(last.cx, last.cy, sternZ);
     for (let s = 0; s < segs; s++) {
       const s2 = (s + 1) % segs;
-      indices.push(noseTip, s, s2);
+      // Nose cap faces -Z (outward); stern cap faces +Z (outward).
+      indices.push(noseTip, s2, s);
       const a = samples * segs + s;
       const b = samples * segs + s2;
-      indices.push(sternCap, b, a);
+      indices.push(sternCap, a, b);
     }
 
     const geo = new THREE.BufferGeometry();
