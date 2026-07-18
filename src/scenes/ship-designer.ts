@@ -521,6 +521,12 @@ function setup(ctx: SceneContext): SceneInstance {
     roughnessMap: hullPanelMap,
   });
   const nozzleMaterial = new THREE.MeshStandardMaterial({ color: "#2b2f38", metalness: 0.5, roughness: 0.5, envMap, envMapIntensity: 0.6 });
+  // Near-black "bored hole" backing shared by engine heat-vent recesses and weapon muzzle
+  // rings; the heat core self-glows so an exhaust reads as hot without any scene light.
+  // Setup-scoped (rebuilds reuse them); disposed once at teardown — disposeHullMeshes
+  // reclaims geometry only.
+  const recessMaterial = new THREE.MeshStandardMaterial({ color: "#14161c", roughness: 1 });
+  const heatMaterial = new THREE.MeshStandardMaterial({ color: "#3a1204", emissive: "#ff7a2a", emissiveIntensity: 1.6 });
 
   const moduleGroup = new THREE.Group();
   const hullGroup = new THREE.Group();
@@ -622,23 +628,19 @@ function setup(ctx: SceneContext): SceneInstance {
     }
     return true;
   }
-  // External hardpoint: at least one footprint cell has at least one FREE orthogonal
-  // neighbor (i.e. the weapon is not fully buried). A neighbor inside the footprint
-  // itself doesn't count as free — it's internal.
-  function weaponHardpointAt(x: number, y: number, z: number, dx: number, dy: number, dz: number, exclude: Module | null): boolean {
+  // Weapon muzzle clearance (mirror of engineRearClearAt on the opposite face): every
+  // FRONT-face cell (the -z outermost layer of the footprint) must have a FREE cell
+  // directly in front of it (-z), so the muzzle fires into open space instead of hull.
+  // Replaces the looser "not fully buried" hardpoint rule — a weapon poking out sideways
+  // had no forward firing arc, yet passed.
+  function weaponMuzzleClearAt(x: number, y: number, z: number, dx: number, dy: number, _dz: number, exclude: Module | null): boolean {
+    const ahead = z - 1; // cell layer immediately in front of the front face
     for (let ix = x; ix < x + dx; ix++) {
       for (let iy = y; iy < y + dy; iy++) {
-        for (let iz = z; iz < z + dz; iz++) {
-          for (const [ddx, ddy, ddz] of DIRS) {
-            const nx = ix + ddx, ny = iy + ddy, nz = iz + ddz;
-            const inside = nx >= x && nx < x + dx && ny >= y && ny < y + dy && nz >= z && nz < z + dz;
-            if (inside) continue;
-            if (!occupantAt(nx, ny, nz, exclude)) return true;
-          }
-        }
+        if (occupantAt(ix, iy, ahead, exclude)) return false;
       }
     }
-    return false;
+    return true;
   }
 
   // ---- module lifecycle -------------------------------------------------------------
@@ -746,7 +748,7 @@ function setup(ctx: SceneContext): SceneInstance {
           if (!footprintFree(x, y, z, dx, dy, dz, exclude)) continue;
           if (!footprintHasNeighbor(x, y, z, dx, dy, dz, exclude)) continue;
           if (type === "engine" && !engineRearClearAt(x, y, z, dx, dy, dz, exclude)) continue;
-          if (type === "weapon" && !weaponHardpointAt(x, y, z, dx, dy, dz, exclude)) continue;
+          if (type === "weapon" && !weaponMuzzleClearAt(x, y, z, dx, dy, dz, exclude)) continue;
           out.push({ x, y, z });
         }
       }
@@ -847,10 +849,10 @@ function setup(ctx: SceneContext): SceneInstance {
     for (const m of blocked) offending.add(m);
     if (blocked.length > 0) issues.push(`${blocked.length > 1 ? `${blocked.length} engines` : "engine"} exhaust blocked`);
 
-    // Rule: every weapon must have a free neighbor (an external hardpoint, not buried).
-    const buried = modules.filter((m) => m.type === "weapon" && !weaponHardpointAt(m.x, m.y, m.z, m.dx, m.dy, m.dz, null));
-    for (const m of buried) offending.add(m);
-    if (buried.length > 0) issues.push(`${buried.length > 1 ? `${buried.length} weapons` : "weapon"} buried`);
+    // Rule: every weapon needs clear space directly in front of its muzzle (front face).
+    const blockedMuzzles = modules.filter((m) => m.type === "weapon" && !weaponMuzzleClearAt(m.x, m.y, m.z, m.dx, m.dy, m.dz, null));
+    for (const m of blockedMuzzles) offending.add(m);
+    if (blockedMuzzles.length > 0) issues.push(`${blockedMuzzles.length > 1 ? `${blockedMuzzles.length} weapon muzzles` : "weapon muzzle"} blocked`);
 
     // Rule: everything must form one connected component; islands are unpowered.
     const largest = largestComponent();
@@ -934,23 +936,63 @@ function setup(ctx: SceneContext): SceneInstance {
     for (const g of geometries) g.dispose();
     hullGroup.clear();
   }
-  function addEngineNozzles(rearPlaneZFor: (m: Module) => number): void {
-    // One nozzle per engine footprint cell on the engine's rear face — an XL engine
-    // (2x2 rear layer) gets a 2x2 nozzle cluster. The hull visibly reflects the
-    // propulsion layout, whichever style is on.
-    const nozzleLen = 0.9 * CELL;
-    // Bury the forward end into the stern so they read as attached, not floating.
-    const embed = 0.45 * CELL;
-    const nozzleGeometry = new THREE.CylinderGeometry(0.35 * CELL, 0.35 * CELL, nozzleLen, 12);
+  // Engine exhaust used to be a fat extruded cylinder (0.35·CELL radius, protruding
+  // 0.45·CELL past the stern), which visibly clipped the shell wherever the hull surface
+  // wasn't the flat plane the cylinder assumed. Now each rear-face cell wears a recessed
+  // HEAT VENT: a dark plug cylinder buried almost entirely in the hull (its face a hair
+  // proud of the stern plane) with a self-glowing core disc on top. The buried body
+  // bridges however the shell curves near the plane — skinned SDF bulges included —
+  // while the 0.08 protrusion is too shallow to read as clipping from any angle.
+  function addEngineHeatVents(rearPlaneZFor: (m: Module) => number): void {
+    // One vent per engine footprint cell on the rear face — an XL engine (2x2 rear
+    // layer) gets a 2x2 vent cluster, so the hull still reflects the propulsion layout.
+    // Geometries are shared across meshes; disposeHullMeshes reclaims them via its Set.
+    const plugLen = 0.5 * CELL;
+    const plugGeometry = new THREE.CylinderGeometry(0.40 * CELL, 0.40 * CELL, plugLen, 20);
+    const coreGeometry = new THREE.CircleGeometry(0.26 * CELL, 20);
     for (const m of modules) {
       if (m.type !== "engine") continue;
       const rz = rearPlaneZFor(m);
       for (let ix = m.x; ix < m.x + m.dx; ix++) {
         for (let iy = m.y; iy < m.y + m.dy; iy++) {
-          const nozzle = new THREE.Mesh(nozzleGeometry, nozzleMaterial);
-          nozzle.rotation.x = Math.PI / 2; // align cylinder's y axis with +z
-          nozzle.position.set(cellX(ix), cellY(iy), rz + nozzleLen / 2 - embed);
-          hullGroup.add(nozzle);
+          const plug = new THREE.Mesh(plugGeometry, recessMaterial);
+          plug.rotation.x = Math.PI / 2; // align cylinder's y axis with +z
+          plug.position.set(cellX(ix), cellY(iy), rz + 0.08 - plugLen / 2);
+          hullGroup.add(plug);
+          // CircleGeometry faces +z by default — right way out for a stern decal.
+          const core = new THREE.Mesh(coreGeometry, heatMaterial);
+          core.position.set(cellX(ix), cellY(iy), rz + 0.09);
+          hullGroup.add(core);
+        }
+      }
+    }
+  }
+  // Weapon muzzles mirror the heat vents on the FRONT (-z) side: per front-face cell, a
+  // dark bore plug (mostly buried, face just shy of the front plane) plus a thin gunmetal
+  // barrel running forward to the style's tip plane. The barrel stays at 0.10·CELL radius
+  // ON PURPOSE — it must emerge through whatever shell curvature sits ahead of the plane
+  // without ever reading as the old clipped-cylinder bug; fatten it and it will.
+  function addWeaponMuzzles(frontPlaneZFor: (m: Module) => number, barrelTipZFor: (m: Module) => number): void {
+    const boreLen = 0.5 * CELL;
+    const boreGeometry = new THREE.CylinderGeometry(0.24 * CELL, 0.24 * CELL, boreLen, 16);
+    for (const m of modules) {
+      if (m.type !== "weapon") continue;
+      const fz = frontPlaneZFor(m);
+      const tip = barrelTipZFor(m);
+      // Barrel spans from a buried base just behind the front plane to the tip.
+      const base = fz + 0.2 * CELL;
+      const barrelLen = Math.max(0.4 * CELL, base - tip);
+      const barrelGeometry = new THREE.CylinderGeometry(0.10 * CELL, 0.10 * CELL, barrelLen, 12);
+      for (let ix = m.x; ix < m.x + m.dx; ix++) {
+        for (let iy = m.y; iy < m.y + m.dy; iy++) {
+          const bore = new THREE.Mesh(boreGeometry, recessMaterial);
+          bore.rotation.x = Math.PI / 2;
+          bore.position.set(cellX(ix), cellY(iy), fz - 0.08 + boreLen / 2);
+          hullGroup.add(bore);
+          const barrel = new THREE.Mesh(barrelGeometry, nozzleMaterial);
+          barrel.rotation.x = Math.PI / 2;
+          barrel.position.set(cellX(ix), cellY(iy), (base + tip) / 2);
+          hullGroup.add(barrel);
         }
       }
     }
@@ -1003,7 +1045,13 @@ function setup(ctx: SceneContext): SceneInstance {
       pad: CELL * 1.1,
     });
     if (geo) hullGroup.add(new THREE.Mesh(geo, hullMaterial));
-    addEngineNozzles((m) => cellZ(m.z + m.dz - 1) + CELL / 2 + skin);
+    addEngineHeatVents((m) => cellZ(m.z + m.dz - 1) + CELL / 2 + skin);
+    // Weapon front face + skin, mirroring the vents; the muzzle-clear rule guarantees an
+    // empty cell ahead, so the SDF shell retreats there and the short barrel clears it.
+    addWeaponMuzzles(
+      (m) => cellZ(m.z) - CELL / 2 - skin,
+      (m) => cellZ(m.z) - CELL / 2 - skin - 0.3 * CELL,
+    );
   }
 
   // Lofted fuselage (kept as a lighter alternative): Catmull-Rom profiles + ogive nose.
@@ -1141,8 +1189,11 @@ function setup(ctx: SceneContext): SceneInstance {
     geo.computeVertexNormals();
     hullGroup.add(new THREE.Mesh(geo, hullMaterial));
 
-    // Seat nozzles on the flat rear face so they read as attached exhausts.
-    addEngineNozzles(() => sternZ);
+    // Seat heat vents flush on the flat stern cap; weapon barrels run from the weapon's
+    // buried bore through the ogive nose and emerge just short of the tip — the visible
+    // length varies with how deep the gun sits, which reads like a proper nose battery.
+    addEngineHeatVents(() => sternZ);
+    addWeaponMuzzles(() => z0 - CELL / 2, () => noseZ - 0.2 * CELL);
   }
   // The original single-shell alternative, kept for comparison: an inflated
   // box over the installed modules' bounding volume with a cone nose.
@@ -1179,7 +1230,9 @@ function setup(ctx: SceneContext): SceneInstance {
     hullGroup.add(nose);
 
     const rearZ = cz + sz / 2;
-    addEngineNozzles(() => rearZ);
+    const frontZ = cz - sz / 2; // the flat -z face; the cone nose sits over its centre
+    addEngineHeatVents(() => rearZ);
+    addWeaponMuzzles(() => frontZ, () => frontZ - 0.3 * CELL);
   }
 
   // ---- view + camera ----------------------------------------------------------------
@@ -1304,17 +1357,17 @@ function setup(ctx: SceneContext): SceneInstance {
     }
     if (enginesMoved > 0) done.push(`cleared ${enginesMoved} engine exhaust${enginesMoved > 1 ? "s" : ""}`);
 
-    // (b) Buried weapons → nearest valid anchor (a free neighbor / hardpoint).
+    // (b) Muzzle-blocked weapons → nearest valid anchor (clear space ahead, touches, fits).
     let weaponsMoved = 0;
     for (const m of modules) {
-      if (m.type !== "weapon" || weaponHardpointAt(m.x, m.y, m.z, m.dx, m.dy, m.dz, m)) continue;
+      if (m.type !== "weapon" || weaponMuzzleClearAt(m.x, m.y, m.z, m.dx, m.dy, m.dz, m)) continue;
       const dest = nearestAnchor(validAnchorsFor(m.type, m.dx, m.dy, m.dz, m), m.x, m.y, m.z);
       if (dest) {
         setModulePos(m, dest.x, dest.y, dest.z);
         weaponsMoved++;
       }
     }
-    if (weaponsMoved > 0) done.push(`moved ${weaponsMoved} weapon${weaponsMoved > 1 ? "s" : ""} to a hardpoint`);
+    if (weaponsMoved > 0) done.push(`cleared ${weaponsMoved} weapon muzzle${weaponsMoved > 1 ? "s" : ""}`);
 
     // (c) Anything still off the main component gets scrapped.
     const largest = largestComponent();
@@ -1775,6 +1828,8 @@ function setup(ctx: SceneContext): SceneInstance {
       hullPanelMap.dispose();
       hullMaterial.dispose();
       nozzleMaterial.dispose();
+      recessMaterial.dispose();
+      heatMaterial.dispose();
       envMap.dispose();
       pmrem.dispose();
 
