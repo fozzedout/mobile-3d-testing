@@ -1,6 +1,8 @@
 import * as THREE from "three";
 import type { SceneContext, SceneInstance, TestScene } from "./types.ts";
 import { ScannerHUD } from "../core/scanner-hud.ts";
+import { LandingHUD } from "../core/landing-hud.ts";
+import { TargetPointer } from "../core/target-pointer.ts";
 import { FlightRig } from "../core/flight-rig.ts";
 import { buildStarfield } from "../core/starfield.ts";
 
@@ -43,11 +45,55 @@ const BERTH_CLEAR_R = 64;
 
 const APERTURE_WORLD = new THREE.Vector3(0, 0, HUB_HALF); // on the spin axis — invariant under the spin
 
+// --- Player berth + magnetic capture, ported from docking-bay.ts ---
+// Berth 7 is reserved for the player (the parked-ship slider fills 0..6, so
+// with the player clamped in, the bay holds the brief's 4–8 ships). The berth
+// frame swaps docking-bay's "down is -y" for "down is radially outward": the
+// pad lies ON the bay wall, its up axis points at the spin axis.
+const PLAYER_BERTH = 7;
+const BERTH_A = (PLAYER_BERTH / BERTHS) * Math.PI * 2;
+const PAD_SURFACE_R = 83; // pad box inner face: centred at r=85, 4 thick
+const SEAT_R = PAD_SURFACE_R - SHIP_RADIUS - 0.6; // ship-centre rest radius (0.6 clearance, as in docking-bay)
+const SEAT_LOCAL = new THREE.Vector3(Math.cos(BERTH_A) * SEAT_R, Math.sin(BERTH_A) * SEAT_R, BERTH_Z);
+const PAD_LOCAL = new THREE.Vector3(Math.cos(BERTH_A) * PAD_SURFACE_R, Math.sin(BERTH_A) * PAD_SURFACE_R, BERTH_Z);
+const BERTH_UP_LOCAL = new THREE.Vector3(-Math.cos(BERTH_A), -Math.sin(BERTH_A), 0); // radially inward
+const BERTH_TAN_LOCAL = new THREE.Vector3(-Math.sin(BERTH_A), Math.cos(BERTH_A), 0);
+// The berth-band clearance cylinder protects the parked ships, but the player
+// must reach THEIR pad — within this angular sector of the berth the wall
+// collider relaxes back to the true bay wall.
+const SECTOR_COS = Math.cos(0.28);
+
+// Capture-field tuning: identical numbers to docking-bay (they were settled on
+// real-device feedback there, and the ship + pad geometry are the same size).
+const CAPTURE_RADIUS = 12;
+const CAPTURE_SPEED = 8;
+const CAPTURE_PULL = 1;
+const CAPTURE_REEL = 5;
+const CAPTURE_GAIN = 3;
+const CAPTURE_MAX_ACCEL = 15;
+const CAPTURE_ALIGN_RATE = 0.9;
+const SNAP_DIST = 0.7;
+const SNAP_SPEED = 0.8;
+const LAND_SPEED = 4;
+const HOLD_SECONDS = 1.5;
+
 // Per-frame scratch (see docking-bay.ts for the rationale — the same
 // allocation-free pattern, update() is never re-entrant).
 const _invQuat = new THREE.Quaternion();
 const _local = new THREE.Vector3();
 const _pushN = new THREE.Vector3();
+const _padVel = new THREE.Vector3();
+const _relVel = new THREE.Vector3(); // world (ship − pad point), later rotated station-local for the HUD
+const _seatOff = new THREE.Vector3();
+const _seatWorld = new THREE.Vector3();
+const _padWorld = new THREE.Vector3();
+const _capAccel = new THREE.Vector3();
+const _shipUp = new THREE.Vector3();
+const _berthUp = new THREE.Vector3();
+const _alignQuat = new THREE.Quaternion();
+const _stepQuat = new THREE.Quaternion();
+const _frameQuat = new THREE.Quaternion();
+const _spinAxis = new THREE.Vector3(0, 0, 1); // the station's only rotation axis (never mutated)
 
 function setup(ctx: SceneContext): SceneInstance {
   const { scene, gui, camera, controls, canvas } = ctx;
@@ -195,19 +241,46 @@ function setup(ctx: SceneContext): SceneInstance {
     return g;
   }
 
+  const playerPadMat = mat(
+    new THREE.MeshStandardMaterial({ color: "#0a3d1f", emissive: "#22c55e", emissiveIntensity: 0.9 }),
+  );
   const berthedShips: THREE.Group[] = [];
   for (let i = 0; i < BERTHS; i++) {
     const a = (i / BERTHS) * Math.PI * 2;
-    const pad = new THREE.Mesh(padGeo, padMat);
+    const pad = new THREE.Mesh(padGeo, i === PLAYER_BERTH ? playerPadMat : padMat);
     pad.position.set(Math.cos(a) * 85, Math.sin(a) * 85, BERTH_Z);
     pad.rotation.z = a + Math.PI / 2; // pad local +Y → radially inward
     stationGroup.add(pad);
+    if (i === PLAYER_BERTH) continue; // the player's berth stays open — its pad glows bright green
     const ship = makeShip();
     ship.position.set(Math.cos(a) * BERTH_SHIP_R, Math.sin(a) * BERTH_SHIP_R, BERTH_Z);
     ship.rotation.z = a + Math.PI / 2; // ship belly to the wall, nose out the aperture
     stationGroup.add(ship);
     berthedShips.push(ship);
   }
+
+  // Magnetic capture volume over the player's pad — same faint green column as
+  // docking-bay, here standing radially in from the bay wall.
+  const captureColumnGeo = geom(
+    new THREE.CylinderGeometry(CAPTURE_RADIUS, CAPTURE_RADIUS, CAPTURE_RADIUS * 1.6, 24, 1, true),
+  );
+  const captureColumnMat = mat(
+    new THREE.MeshBasicMaterial({
+      color: "#22c55e",
+      transparent: true,
+      opacity: 0.06,
+      side: THREE.DoubleSide,
+      depthWrite: false,
+    }),
+  );
+  const captureColumn = new THREE.Mesh(captureColumnGeo, captureColumnMat);
+  {
+    const colR = PAD_SURFACE_R - CAPTURE_RADIUS * 0.8;
+    captureColumn.position.set(Math.cos(BERTH_A) * colR, Math.sin(BERTH_A) * colR, BERTH_Z);
+    captureColumn.rotation.z = BERTH_A + Math.PI / 2; // cylinder axis along the berth's radial
+  }
+  captureColumn.visible = false;
+  stationGroup.add(captureColumn);
 
   // --- Window lights: the single biggest "it's inhabited and huge" cue.
   // One InstancedMesh: ~2,400 on the ring torus, ~220 on the hub shell, plus
@@ -370,6 +443,15 @@ function setup(ctx: SceneContext): SceneInstance {
   camera.quaternion.copy(rig.quaternion);
 
   const scanner = new ScannerHUD(150, 5200);
+  const landingHud = new LandingHUD();
+  const pointer = new TargetPointer();
+
+  // Capture-field state, mirroring docking-bay: `capturing` is the soft,
+  // breakable field hold; `attached` is the hard clamp welding the ship into
+  // the rotating frame (world pose regenerated from SEAT_LOCAL every frame).
+  let capturing = false;
+  let attached = false;
+  let holdTime = 0;
 
   const settings = {
     spin: 0.02, // rad/s — one revolution ≈ 5¼ min; giant structures should turn SLOWLY
@@ -387,19 +469,29 @@ function setup(ctx: SceneContext): SceneInstance {
   }
   applyDockedShips();
 
+  function resetDockingState(): void {
+    capturing = false;
+    attached = false;
+    holdTime = 0;
+    rig.assistBrake = true;
+    captureColumn.visible = false;
+    pointer.setVisible(false);
+  }
   function restart(): void {
     rig.reset(SPAWN);
     stationGroup.rotation.z = 0;
+    resetDockingState();
   }
   function jumpToFinal(): void {
     rig.reset([0, 80, 1600]);
+    resetDockingState();
   }
 
   rig.registerControls(gui);
   gui.add(readout, "status").name("Status").listen().disable();
   gui.add(readout, "distance").name("Dock distance").listen().disable();
   gui.add(readout, "scale").name("Scale").disable();
-  gui.add(settings, "dockedShips", 4, 8, 1).name("Berthed ships").onChange(applyDockedShips);
+  gui.add(settings, "dockedShips", 4, 7, 1).name("Berthed ships (you're #8)").onChange(applyDockedShips);
   gui.add(settings, "spin", 0, 0.06, 0.005).name("Spin (rad/s)");
   gui.add(settings, "traffic").name("Shuttle traffic").onChange((v: boolean) => (trafficGroup.visible = v));
   gui.add({ jumpToFinal }, "jumpToFinal").name("Skip to final approach");
@@ -451,7 +543,12 @@ function setup(ctx: SceneContext): SceneInstance {
     const inBayColumn = rxy < BAY_R && _local.z > BAY_BACK - SHIP_RADIUS && _local.z < HUB_HALF + SHIP_RADIUS;
     if (inBayColumn) {
       const inBerthBand = _local.z > BERTH_BAND_MIN && _local.z < BERTH_BAND_MAX;
-      const wallR = inBerthBand ? BERTH_CLEAR_R : BAY_R;
+      // The clearance cylinder guards the PARKED ships — inside the player's
+      // own berth sector the wall relaxes to the true bay radius so the pad
+      // (and the field's seat point) is actually reachable.
+      const towardOwnBerth =
+        rxy > 1e-3 && (_local.x * Math.cos(BERTH_A) + _local.y * Math.sin(BERTH_A)) / rxy > SECTOR_COS;
+      const wallR = inBerthBand && !towardOwnBerth ? BERTH_CLEAR_R : BAY_R;
       if (rxy > wallR - SHIP_RADIUS && rxy > 1e-3) {
         _n.set(-_local.x / rxy, -_local.y / rxy, 0);
         applyPush(_n, rxy - (wallR - SHIP_RADIUS));
@@ -487,9 +584,71 @@ function setup(ctx: SceneContext): SceneInstance {
 
       stationGroup.rotation.z += settings.spin * delta;
 
+      // Clamped: weld the ship into the rotating frame (see docking-bay for the
+      // full rationale) — pose regenerated from the local seat, view co-rotated
+      // by the frame's delta, velocity slaved to the pad point's ω × r.
+      if (attached) {
+        rig.position.copy(SEAT_LOCAL).applyQuaternion(stationGroup.quaternion);
+        _frameQuat.setFromAxisAngle(_spinAxis, settings.spin * delta);
+        rig.quaternion.premultiply(_frameQuat);
+        rig.velocity.set(-settings.spin * rig.position.y, settings.spin * rig.position.x, 0);
+      }
+
       _invQuat.copy(stationGroup.quaternion).invert();
       _local.copy(rig.position).applyQuaternion(_invQuat);
-      collide();
+
+      // Deliberate thrust releases the clamp; the ship keeps the tangential
+      // velocity it was rotating with and normal physics resume.
+      if (attached && rig.translationInput > 0.3) {
+        attached = false;
+        holdTime = 0;
+      }
+      if (!attached) collide();
+
+      // Pad-relative kinematics drive the capture field and the landing HUD.
+      _padVel.set(-settings.spin * rig.position.y, settings.spin * rig.position.x, 0);
+      const relSpeed = _relVel.copy(rig.velocity).sub(_padVel).length();
+      const seatDist = _seatOff.copy(SEAT_LOCAL).sub(_local).length();
+
+      if (!attached) {
+        if (capturing) {
+          if (rig.translationInput > 0.3 || seatDist > CAPTURE_RADIUS * 1.5) capturing = false;
+        } else if (seatDist < CAPTURE_RADIUS && relSpeed < CAPTURE_SPEED && rig.translationInput <= 0.3) {
+          capturing = true;
+        }
+
+        if (capturing) {
+          // Velocity servo reeling the ship onto the seat (docking-bay's exact
+          // scheme — see the long comment there for why not a spring-damper).
+          _seatWorld.copy(SEAT_LOCAL).applyQuaternion(stationGroup.quaternion);
+          _capAccel.copy(_seatWorld).sub(rig.position);
+          const reel = Math.min(_capAccel.length() * CAPTURE_PULL, CAPTURE_REEL);
+          _capAccel.normalize().multiplyScalar(reel).add(_padVel).sub(rig.velocity);
+          _capAccel.multiplyScalar(CAPTURE_GAIN);
+          const am = _capAccel.length();
+          if (am > CAPTURE_MAX_ACCEL) _capAccel.multiplyScalar(CAPTURE_MAX_ACCEL / am);
+          rig.velocity.addScaledVector(_capAccel, delta);
+
+          // Right the ship: its up axis eases onto the berth's up — which
+          // points at the SPIN AXIS here, not world +y; belly to the bay wall.
+          _shipUp.set(0, 1, 0).applyQuaternion(rig.quaternion);
+          _berthUp.copy(BERTH_UP_LOCAL).applyQuaternion(stationGroup.quaternion);
+          _alignQuat.setFromUnitVectors(_shipUp, _berthUp);
+          _stepQuat.identity().rotateTowards(_alignQuat, CAPTURE_ALIGN_RATE * delta);
+          rig.quaternion.premultiply(_stepQuat).normalize();
+
+          if (seatDist < SNAP_DIST && relSpeed < SNAP_SPEED) {
+            attached = true;
+            capturing = false;
+            rig.velocity.copy(_padVel);
+            rig.position.copy(SEAT_LOCAL).applyQuaternion(stationGroup.quaternion);
+          }
+        }
+      }
+      if (attached) holdTime += delta;
+      // Suspend the rig's hands-off brake while the field owns velocity
+      // (docking-bay's fix: the assist out-muscles the field, frame-rate-dependently).
+      rig.assistBrake = !capturing;
 
       camera.position.copy(rig.position);
       camera.quaternion.copy(rig.quaternion);
@@ -522,8 +681,15 @@ function setup(ctx: SceneContext): SceneInstance {
       readout.distance = `${Math.round(dist).toLocaleString()} u`;
       const rxyLocal = Math.hypot(_local.x, _local.y);
       const insideBay = rxyLocal < BAY_R && _local.z > BAY_BACK && _local.z < HUB_HALF;
-      if (insideBay) {
-        readout.status = `In the hub bay — ${settings.dockedShips}/${BERTHS} berths occupied`;
+      if (attached) {
+        readout.status =
+          holdTime < HOLD_SECONDS
+            ? "Touchdown — clamps engaging…"
+            : `Docked ✓ — ${settings.dockedShips + 1}/${BERTHS} berths full (thrust to release)`;
+      } else if (capturing) {
+        readout.status = "Magnetic capture — field has you";
+      } else if (insideBay) {
+        readout.status = "In the bay — drift into the green pad's field";
       } else if (dist < 700) {
         readout.status = "Final — thread the glowing aperture";
       } else if (dist < 2600) {
@@ -532,13 +698,65 @@ function setup(ctx: SceneContext): SceneInstance {
         readout.status = "Inbound — the glow ahead is the dock; the ring is 3.8 km wide";
       }
 
-      scanner.update(rig.position, rig.quaternion, [
-        { label: "Dock", color: "#7dd3fc", position: APERTURE_WORLD },
-      ]);
+      // Instrument swap, as in docking-bay: the scanner hands over to the
+      // landing HUD inside the bay, so the shared HUD slot never doubles up.
+      const showLanding = insideBay || attached;
+      scanner.setVisible(!showLanding);
+      landingHud.setVisible(showLanding);
+
+      if (showLanding) {
+        // Everything on the gauge lives in the BERTH'S ROTATING FRAME: "up" is
+        // radially inward, "lateral X" is the bay-wall tangent, "lateral Z" the
+        // spin axis. Rotation-matched with the pad reads as zero drift.
+        _relVel.applyQuaternion(_invQuat); // world rel vel (computed above) -> station-local
+        const latX =
+          (_local.x - PAD_LOCAL.x) * BERTH_TAN_LOCAL.x + (_local.y - PAD_LOCAL.y) * BERTH_TAN_LOCAL.y;
+        const latZ = _local.z - BERTH_Z;
+        const height = PAD_SURFACE_R - rxyLocal - SHIP_RADIUS; // 0 = resting on the pad
+        const relX = _relVel.x * BERTH_TAN_LOCAL.x + _relVel.y * BERTH_TAN_LOCAL.y;
+        const relY = _relVel.x * BERTH_UP_LOCAL.x + _relVel.y * BERTH_UP_LOCAL.y; // negative = descending onto the pad
+        const overFoot = Math.abs(latX) < 7 && Math.abs(latZ) < 13; // pad footprint: 14 × 26
+        landingHud.update({
+          lateralX: latX,
+          lateralZ: latZ,
+          height,
+          relVelX: relX,
+          relVelZ: _relVel.z,
+          relVelY: relY,
+          landSpeed: LAND_SPEED,
+          inWindow: overFoot && height > -0.5 && height < 2.5,
+          holdFrac: attached ? Math.min(1, holdTime / HOLD_SECONDS) : 0,
+        });
+      }
+
+      // Screen-space berth cue + capture column, hidden once clamped.
+      const showPointer = showLanding && !attached;
+      pointer.setVisible(showPointer);
+      _padWorld.copy(PAD_LOCAL).applyQuaternion(stationGroup.quaternion);
+      if (showPointer) pointer.update(camera, _padWorld, "PAD");
+      captureColumn.visible = showPointer;
+      if (showPointer) captureColumnMat.opacity = capturing ? 0.1 + 0.05 * Math.sin(elapsed * 4) : 0.06;
+
+      if (!showLanding) {
+        // Scanner tracks the dock aperture from range; once close, the berth
+        // pad itself joins so you can line up the entry with your own slot.
+        scanner.update(
+          rig.position,
+          rig.quaternion,
+          dist < 1600
+            ? [
+                { label: "Dock", color: "#7dd3fc", position: APERTURE_WORLD },
+                { label: "Berth", color: "#22c55e", position: _padWorld },
+              ]
+            : [{ label: "Dock", color: "#7dd3fc", position: APERTURE_WORLD }],
+        );
+      }
     },
     dispose() {
       rig.dispose();
       scanner.dispose();
+      landingHud.dispose();
+      pointer.dispose();
 
       windows.dispose();
       greebles.dispose();
@@ -568,6 +786,6 @@ export const megaStationScene: TestScene = {
   id: "mega-station",
   name: "Mega Station (Scale Test)",
   description:
-    "Approach a colossal rotating ring station — the bulk lives in the 3.8 km outer ring, the axis hub berths up to 8 ships.",
+    "Approach a colossal rotating ring station — the bulk lives in the 3.8 km outer ring, the axis hub berths up to 8 ships; a magnetic capture field guides you onto your own pad.",
   setup,
 };

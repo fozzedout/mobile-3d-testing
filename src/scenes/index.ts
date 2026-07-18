@@ -92,7 +92,7 @@ export const sceneRegistry: SceneMeta[] = [
     id: "mega-station",
     name: "Mega Station (Scale Test)",
     description:
-      "Approach a colossal rotating ring station — the bulk lives in the 3.8 km outer ring, the axis hub berths up to 8 ships.",
+      "Approach a colossal rotating ring station — the bulk lives in the 3.8 km outer ring, the axis hub berths up to 8 ships; a magnetic capture field guides you onto your own pad.",
     load: () => import("./mega-station.ts").then((m) => m.megaStationScene),
   },
   {
