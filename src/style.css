@@ -167,6 +167,20 @@ body {
   text-overflow: ellipsis;
 }
 
+/* Torus-walk mini-map: fixed top-left, tucked below the scene dropdown — clear
+   of the GUI panel (top-right) and the fire-zone (bottom-left). */
+.torus-map {
+  position: fixed;
+  top: calc(var(--safe-top) + 56px);
+  left: calc(var(--safe-left) + 8px);
+  z-index: 25;
+  border: 1px solid #2b2f3a;
+  border-radius: 10px;
+  background: rgba(20, 22, 28, 0.82);
+  backdrop-filter: blur(6px);
+  pointer-events: none;
+}
+
 .stick-base {
   position: fixed;
   z-index: 18;

@@ -94,4 +94,11 @@ export const sceneRegistry: SceneMeta[] = [
     description: "Timed docking at a spinning voxel station — enter the rotating slot, land on the pad, take off and exit clean.",
     load: () => import("./docking-bay.ts").then((m) => m.dockingBayScene),
   },
+  {
+    id: "torus-walk",
+    name: "Walk: Torus Station",
+    description:
+      "First-person walking tour of a true-scale 1975 NASA Stanford Torus: pace the 5.9 km rim past lettered sector signage (A–F), ride a spoke elevator to the low-gravity hub, and feel the megastructure's size.",
+    load: () => import("./torus-walk.ts").then((m) => m.torusWalkScene),
+  },
 ];
