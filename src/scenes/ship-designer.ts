@@ -1373,10 +1373,34 @@ function setup(ctx: SceneContext): SceneInstance {
   }
   function rotateSelected(axis: "yaw" | "pitch"): void {
     if (!selected) return;
-    rotateModule(selected, axis);
+    const m = selected;
+    // Validate the ROTATED footprint before committing — an in-place rotation is a
+    // placement like any other: an M/L block swung around its anchor can land inside
+    // occupied cells (visibly interpenetrating), detach from the structure, or violate
+    // its own type rule. Same gates as drag placement; a rejection leaves the block
+    // untouched and says why. (S/XL cubes pass trivially — their swap is a no-op.)
+    const ndx = axis === "yaw" ? m.dz : m.dx;
+    const ndy = axis === "yaw" ? m.dy : m.dz;
+    const ndz = axis === "yaw" ? m.dx : m.dy;
+    if (!footprintFree(m.x, m.y, m.z, ndx, ndy, ndz, m)) {
+      readout.status = "No room to rotate — blocked by adjacent blocks";
+      return;
+    }
+    if (modules.length > 1 && !footprintHasNeighbor(m.x, m.y, m.z, ndx, ndy, ndz, m)) {
+      readout.status = "Can't rotate — it would detach from the ship";
+      return;
+    }
+    if (m.type === "engine" && !engineRearClearAt(m.x, m.y, m.z, ndx, ndy, ndz, m)) {
+      readout.status = "Can't rotate — exhaust would be blocked";
+      return;
+    }
+    if (m.type === "weapon" && !weaponMuzzleClearAt(m.x, m.y, m.z, ndx, ndy, ndz, m)) {
+      readout.status = "Can't rotate — muzzle would be blocked";
+      return;
+    }
+    rotateModule(m, axis);
     onLayoutChanged();
   }
-
   // ---- repair -----------------------------------------------------------------------
   function repair(): void {
     const done: string[] = [];
