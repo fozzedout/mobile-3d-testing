@@ -614,7 +614,7 @@ function setup(ctx: SceneContext): SceneInstance {
   archShape.holes.push(door);
   const archGeo = track(new THREE.ShapeGeometry(archShape, 48));
   const archMat = trackM(new THREE.MeshStandardMaterial({ color: "#3a4252", roughness: 0.85, metalness: 0.25, side: THREE.DoubleSide, flatShading: true }));
-  const shaftGeo = track(new THREE.CylinderGeometry(7, 7, 130, 20, 1, true));
+  const shaftGeo = track(new THREE.CylinderGeometry(4.5, 4.5, 130, 16, 1, true));
   const shaftMat = trackM(new THREE.MeshStandardMaterial({ color: "#2a3040", emissive: "#3a5a80", emissiveIntensity: 0.5, roughness: 0.6, metalness: 0.4, side: THREE.DoubleSide }));
   const padMat = trackM(new THREE.MeshBasicMaterial({ color: "#7fe0ff", transparent: true, opacity: 0.85, side: THREE.DoubleSide }));
 
@@ -648,11 +648,18 @@ function setup(ctx: SceneContext): SceneInstance {
     }
     root.add(gate);
 
-    // Spoke shaft: a 14 m cylinder rising from floor through the ceiling toward the axis.
-    const shaft = new THREE.Mesh(shaftGeo, shaftMat);
+    // Spoke structure: a PAIR of columns at the street's edges rather than one fat
+    // shaft on the centreline — a single centred column bisected the walkway and
+    // parked itself exactly in front of the gate sign (real-device feedback). The
+    // pair frames the doorway and sign (sign spans lat ±40; columns sit at ±44,
+    // clear of it from any approach angle) and still reads as the spoke plunging
+    // through the ceiling toward the hub. The actual ride interior is rideGroup.
     const sd = (D_RIM + SUN_R) / 2;
-    setBasis(shaft, _lateral, _er, _tangent, new THREE.Vector3(sd * Math.cos(theta), sd * Math.sin(theta), 0));
-    root.add(shaft);
+    for (const side of [-44, 44]) {
+      const shaft = new THREE.Mesh(shaftGeo, shaftMat);
+      setBasis(shaft, _lateral, _er, _tangent, new THREE.Vector3(sd * Math.cos(theta), sd * Math.sin(theta), side));
+      root.add(shaft);
+    }
 
     // Rim elevator pad + "S1 → HUB" decal on the street.
     const pad = new THREE.Mesh(ringGeo, padMat);
