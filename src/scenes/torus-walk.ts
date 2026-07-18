@@ -249,6 +249,11 @@ function bannerTexture(): THREE.CanvasTexture {
 const RING_SEG = 288;
 const TUBE_SEG = 20;
 const SKY_QUADS = new Set([6, 7, 13, 14]); // tube-segment bands left open as rim skylights
+// Tube-segment bands lying FULLY under the flat street (|lat| < 51 across their whole
+// φ range) are skipped too: the street replaces them visually, and keeping them gave
+// two surfaces 0–25 m apart fighting over kilometre-scale depth slots on phone GPUs —
+// the distant street curve dissolved into a z-fight checkerboard on real devices.
+const UNDER_STREET_QUADS = new Set([0, 1, 18, 19]); // φ ±36° → |lat| ≤ 38 m, r ≥ 952: strictly under the street band
 
 function buildShell(): THREE.BufferGeometry {
   const cols = RING_SEG + 1;
@@ -282,6 +287,7 @@ function buildShell(): THREE.BufferGeometry {
   for (let i = 0; i < RING_SEG; i++) {
     for (let j = 0; j < TUBE_SEG; j++) {
       if (SKY_QUADS.has(j)) continue; // leave the skylight bands open
+      if (UNDER_STREET_QUADS.has(j)) continue; // the street strip replaces these
       const a = i * rows + j;
       const b = (i + 1) * rows + j;
       const c = (i + 1) * rows + (j + 1);
@@ -397,10 +403,16 @@ function setup(ctx: SceneContext): SceneInstance {
   const prevFog = scene.fog;
   const prevBackground = scene.background;
   const prevFar = camera.far;
+  const prevNear = camera.near;
   const interiorTint = new THREE.Color("#151b25");
   scene.fog = new THREE.Fog(interiorTint, 220, 1100); // hides the far tube curving up; keeps the hub clear
   scene.background = interiorTint.clone();
   camera.far = 2600; // hub windows must reach the far rim skylights
+  // Depth precision scales with near/far: the shared renderer's 0.05 near against a
+  // 2600 far starves a phone's depth buffer so badly that surfaces metres apart
+  // checkerboard-fight ~1 km up the curve. Nothing in a WALKING scene ever gets
+  // within half a metre of the eye, so buy back ~100× precision here.
+  camera.near = 0.5;
   camera.updateProjectionMatrix();
   controls.enabled = false;
 
@@ -452,7 +464,9 @@ function setup(ctx: SceneContext): SceneInstance {
   const streetTex = trackT(streetTexture());
   streetTex.wrapS = THREE.RepeatWrapping;
   streetTex.wrapT = THREE.ClampToEdgeWrapping;
-  const streetMat = trackM(new THREE.MeshStandardMaterial({ map: streetTex, roughness: 0.96, metalness: 0.0, side: THREE.DoubleSide }));
+  // polygonOffset biases the street toward the camera where the shell's wall base
+  // grazes its edges — belt and braces on top of the near-plane + skipped-quad fixes.
+  const streetMat = trackM(new THREE.MeshStandardMaterial({ map: streetTex, roughness: 0.96, metalness: 0.0, side: THREE.DoubleSide, polygonOffset: true, polygonOffsetFactor: -1, polygonOffsetUnits: -1 }));
   root.add(new THREE.Mesh(streetGeo, streetMat));
 
   // --- Sun line: the emissive inner-ceiling circle lighting the whole rim ---
@@ -1106,6 +1120,7 @@ function setup(ctx: SceneContext): SceneInstance {
       scene.fog = prevFog;
       scene.background = prevBackground;
       camera.far = prevFar;
+      camera.near = prevNear;
       camera.position.set(3, 2, 4);
       camera.quaternion.identity();
       camera.updateProjectionMatrix();
