@@ -389,6 +389,9 @@ function streetTexture(): THREE.CanvasTexture {
   });
 }
 
+// The axis triple MUST be right-handed (xa × ya = za): setFromRotationMatrix on an
+// improper (det −1) basis yields a garbage orientation — a left-handed triple once had
+// the elevator pad rings standing bolt upright across the street as giant hoops.
 function setBasis(m: THREE.Object3D, xa: THREE.Vector3, ya: THREE.Vector3, za: THREE.Vector3, p: THREE.Vector3): void {
   const mat = new THREE.Matrix4().makeBasis(xa, ya, za);
   m.quaternion.setFromRotationMatrix(mat);
@@ -593,17 +596,24 @@ function setup(ctx: SceneContext): SceneInstance {
   }
 
   // --- Per-spoke structure: bulkhead arch, gate sign, spoke shaft, elevator pad ---
+  // The doorway hole must stay STRICTLY inside the radius-63 disc: earcut's
+  // behaviour is undefined when a hole crosses the outer contour, and the first
+  // build's door (x to 66, corners at radius ~68) triangulated into overlapping
+  // garbage that rendered as a bright self-fighting checkerboard on every GPU.
+  // x 10..59, y ±20 keeps the farthest corner at radius 62.3. In world terms the
+  // door spans d 910–959: from 30 m above the street down past floor level (the
+  // below-floor part is buried), 40 m wide on the 102 m street.
   const archShape = new THREE.Shape();
   archShape.absarc(0, 0, 63, 0, Math.PI * 2, false);
   const door = new THREE.Path();
-  door.moveTo(12, -18);
-  door.lineTo(66, -18);
-  door.lineTo(66, 18);
-  door.lineTo(12, 18);
-  door.lineTo(12, -18);
+  door.moveTo(10, -20);
+  door.lineTo(59, -20);
+  door.lineTo(59, 20);
+  door.lineTo(10, 20);
+  door.lineTo(10, -20);
   archShape.holes.push(door);
   const archGeo = track(new THREE.ShapeGeometry(archShape, 48));
-  const archMat = trackM(new THREE.MeshStandardMaterial({ color: "#232833", roughness: 0.85, metalness: 0.25, side: THREE.DoubleSide, flatShading: true }));
+  const archMat = trackM(new THREE.MeshStandardMaterial({ color: "#3a4252", roughness: 0.85, metalness: 0.25, side: THREE.DoubleSide, flatShading: true }));
   const shaftGeo = track(new THREE.CylinderGeometry(7, 7, 130, 20, 1, true));
   const shaftMat = trackM(new THREE.MeshStandardMaterial({ color: "#2a3040", emissive: "#3a5a80", emissiveIntensity: 0.5, roughness: 0.6, metalness: 0.4, side: THREE.DoubleSide }));
   const padMat = trackM(new THREE.MeshBasicMaterial({ color: "#7fe0ff", transparent: true, opacity: 0.85, side: THREE.DoubleSide }));
@@ -641,13 +651,13 @@ function setup(ctx: SceneContext): SceneInstance {
     // Spoke shaft: a 14 m cylinder rising from floor through the ceiling toward the axis.
     const shaft = new THREE.Mesh(shaftGeo, shaftMat);
     const sd = (D_RIM + SUN_R) / 2;
-    setBasis(shaft, _tangent, _er, _lateral, new THREE.Vector3(sd * Math.cos(theta), sd * Math.sin(theta), 0));
+    setBasis(shaft, _lateral, _er, _tangent, new THREE.Vector3(sd * Math.cos(theta), sd * Math.sin(theta), 0));
     root.add(shaft);
 
     // Rim elevator pad + "S1 → HUB" decal on the street.
     const pad = new THREE.Mesh(ringGeo, padMat);
     pad.scale.set(6, 6, 1);
-    setBasis(pad, _tangent, _lateral, _up, new THREE.Vector3((D_RIM - 0.35) * Math.cos(theta), (D_RIM - 0.35) * Math.sin(theta), 0));
+    setBasis(pad, _lateral, _tangent, _up, new THREE.Vector3((D_RIM - 0.35) * Math.cos(theta), (D_RIM - 0.35) * Math.sin(theta), 0));
     root.add(pad);
     addFloorDecal(theta + 0.012, 0, 10, trackT(padTexture(spokeName, "#7fe0ff")));
     rimPads.push({ theta, x: (D_RIM - EYE) * Math.cos(theta), y: (D_RIM - EYE) * Math.sin(theta) });
@@ -660,7 +670,7 @@ function setup(ctx: SceneContext): SceneInstance {
     const ringMat = trackM(new THREE.MeshBasicMaterial({ color: "#4fe08a", transparent: true, opacity: 0.9, side: THREE.DoubleSide }));
     const ring = new THREE.Mesh(ringGeo, ringMat);
     ring.scale.set(7, 7, 1);
-    setBasis(ring, _tangent, _lateral, _up, new THREE.Vector3((D_RIM - 0.3) * Math.cos(SPAWN_THETA), (D_RIM - 0.3) * Math.sin(SPAWN_THETA), 0));
+    setBasis(ring, _lateral, _tangent, _up, new THREE.Vector3((D_RIM - 0.3) * Math.cos(SPAWN_THETA), (D_RIM - 0.3) * Math.sin(SPAWN_THETA), 0));
     root.add(ring);
     // The banner greets a walker COMPLETING the loop (they arrive moving +θ, so it must
     // face −θ, like the gate signs). It hangs essentially overhead at spawn — 22 m up,
@@ -718,7 +728,7 @@ function setup(ctx: SceneContext): SceneInstance {
     const stripMat = trackM(new THREE.MeshBasicMaterial({ color: SECTORS[k].color }));
     const strip = new THREE.Mesh(stripGeo, stripMat);
     setFrame(a);
-    setBasis(strip, _tangent, _er, _lateral, new THREE.Vector3((D_HUB - 0.6) * Math.cos(a), (D_HUB - 0.6) * Math.sin(a), 0));
+    setBasis(strip, _negTangent, _er, _lateral, new THREE.Vector3((D_HUB - 0.6) * Math.cos(a), (D_HUB - 0.6) * Math.sin(a), 0));
     hubGroup.add(strip);
   }
 
@@ -732,7 +742,7 @@ function setup(ctx: SceneContext): SceneInstance {
     const p = new THREE.Vector3((D_HUB - 0.35) * Math.cos(theta), (D_HUB - 0.35) * Math.sin(theta), 0);
     const hp = new THREE.Mesh(ringGeo, hubPadMat);
     hp.scale.set(5, 5, 1);
-    setBasis(hp, _tangent, _lateral, _up, p);
+    setBasis(hp, _lateral, _tangent, _up, p);
     hubGroup.add(hp);
     for (let z = -30; z <= 30; z += 20) {
       const rail = new THREE.Mesh(railGeo, railMat);
