@@ -89,6 +89,13 @@ export const sceneRegistry: SceneMeta[] = [
     load: () => import("./ship-designer.ts").then((m) => m.shipDesignerScene),
   },
   {
+    id: "mega-station",
+    name: "Mega Station (Scale Test)",
+    description:
+      "Approach a colossal rotating ring station — the bulk lives in the 3.8 km outer ring, the axis hub berths up to 8 ships.",
+    load: () => import("./mega-station.ts").then((m) => m.megaStationScene),
+  },
+  {
     id: "docking-bay",
     name: "Course: Docking Bay",
     description: "Timed docking at a spinning voxel station — enter the rotating slot, land on the pad, take off and exit clean.",
