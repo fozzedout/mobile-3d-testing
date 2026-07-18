@@ -94,6 +94,7 @@ const _alignQuat = new THREE.Quaternion();
 const _stepQuat = new THREE.Quaternion();
 const _frameQuat = new THREE.Quaternion();
 const _spinAxis = new THREE.Vector3(0, 0, 1); // the station's only rotation axis (never mutated)
+const _mDir = new THREE.Vector3(); // touchdown marker's facing (radially inward at the ship's bearing)
 
 function setup(ctx: SceneContext): SceneInstance {
   const { scene, gui, camera, controls, canvas } = ctx;
@@ -282,6 +283,84 @@ function setup(ctx: SceneContext): SceneInstance {
   captureColumn.visible = false;
   stationGroup.add(captureColumn);
 
+  // --- Berth guidance holography. The bay interior was a featureless void, so
+  // there was nothing to judge wall distance against. Four layers fix that:
+  // (a) dim ribs + rails on the bay wall — static structure for parallax/scale;
+  // (b) a chase-pulsing dotted path from the aperture to a hover point over
+  //     the player's berth (the in-bay continuation of the approach lane);
+  // (c) a ladder of shrinking holographic gate rings descending onto the pad;
+  // (d) a touchdown projection ring on the wall "under" the ship (ported from
+  //     docking-bay) — the gap between you and your own shadow marker is the
+  //     strongest read of how far the wall is. Plus a clearance readout in the GUI.
+  const ribMat = mat(new THREE.MeshBasicMaterial({ color: "#1d4a5a" }));
+  const ribGeo = geom(new THREE.TorusGeometry(BAY_R - 0.6, 0.35, 6, 64));
+  for (const z of [BAY_BACK + 30, BAY_BACK + 80, BAY_BACK + 130, HUB_HALF - 20]) {
+    const rib = new THREE.Mesh(ribGeo, ribMat);
+    rib.position.z = z;
+    stationGroup.add(rib);
+  }
+  const railGeo = geom(new THREE.BoxGeometry(0.7, 0.7, bayDepth - 8));
+  for (let i = 0; i < 8; i++) {
+    const a = ((i + 0.5) / 8) * Math.PI * 2; // between berths, clear of pads and ships
+    const rail = new THREE.Mesh(railGeo, ribMat);
+    rail.position.set(Math.cos(a) * (BAY_R - 0.6), Math.sin(a) * (BAY_R - 0.6), BAY_BACK + bayDepth / 2);
+    stationGroup.add(rail);
+  }
+
+  // Guidance holograms rotate with the station and switch off once clamped.
+  const guidance = new THREE.Group();
+  stationGroup.add(guidance);
+
+  const pathDotGeo = geom(new THREE.SphereGeometry(1.4, 6, 6));
+  const pathDotMat = mat(new THREE.MeshBasicMaterial({ color: "#7dd3fc" }));
+  const pathDots: THREE.Mesh[] = [];
+  {
+    // Quadratic bezier from just inside the aperture (on-axis) to the hover
+    // point ~46 u over the seat, bulged slightly toward the berth.
+    const s = new THREE.Vector3(0, 0, HUB_HALF - 30);
+    const c = new THREE.Vector3(Math.cos(BERTH_A) * 12, Math.sin(BERTH_A) * 12, 205);
+    const e = new THREE.Vector3(Math.cos(BERTH_A) * (SEAT_R - 46), Math.sin(BERTH_A) * (SEAT_R - 46), BERTH_Z);
+    const p = new THREE.Vector3();
+    for (let i = 0; i < 8; i++) {
+      const t = i / 7;
+      p.set(0, 0, 0)
+        .addScaledVector(s, (1 - t) * (1 - t))
+        .addScaledVector(c, 2 * (1 - t) * t)
+        .addScaledVector(e, t * t);
+      const dot = new THREE.Mesh(pathDotGeo, pathDotMat);
+      dot.position.copy(p);
+      guidance.add(dot);
+      pathDots.push(dot);
+    }
+  }
+
+  const gateMats: THREE.MeshBasicMaterial[] = [];
+  {
+    const heights = [44, 33, 23, 14, 7]; // above the seat, along the berth's up axis
+    const radii = [17, 14.5, 12, 10, 8]; // shrinking toward the pad
+    const dir = new THREE.Vector3(Math.cos(BERTH_A), Math.sin(BERTH_A), 0);
+    for (let k = 0; k < heights.length; k++) {
+      const gGeo = geom(new THREE.TorusGeometry(radii[k], 0.5, 8, 36));
+      const gMat = mat(
+        new THREE.MeshBasicMaterial({ color: "#22c55e", transparent: true, opacity: 0.3, depthWrite: false }),
+      );
+      gateMats.push(gMat);
+      const gate = new THREE.Mesh(gGeo, gMat);
+      const r = SEAT_R - heights[k]; // "above the pad" = closer to the spin axis
+      gate.position.set(dir.x * r, dir.y * r, BERTH_Z);
+      gate.quaternion.setFromUnitVectors(_spinAxis, dir); // ring plane ⊥ the berth's radial
+      guidance.add(gate);
+    }
+  }
+
+  const markerGeo = geom(new THREE.RingGeometry(2.4, 3.4, 24));
+  const markerMat = mat(
+    new THREE.MeshBasicMaterial({ color: "#22c55e", transparent: true, opacity: 0.85, side: THREE.DoubleSide }),
+  );
+  const marker = new THREE.Mesh(markerGeo, markerMat);
+  marker.visible = false;
+  stationGroup.add(marker);
+
   // --- Window lights: the single biggest "it's inhabited and huge" cue.
   // One InstancedMesh: ~2,400 on the ring torus, ~220 on the hub shell, plus
   // runs of lit dots along both faces of every spoke (they trace the spokes'
@@ -461,6 +540,7 @@ function setup(ctx: SceneContext): SceneInstance {
   const readout = {
     status: "Inbound",
     distance: "",
+    clearance: "—",
     scale: `Ring Ø ${RING_DIAMETER.toLocaleString()} u — old station ≈ 90 u`,
   };
 
@@ -490,6 +570,7 @@ function setup(ctx: SceneContext): SceneInstance {
   rig.registerControls(gui);
   gui.add(readout, "status").name("Status").listen().disable();
   gui.add(readout, "distance").name("Dock distance").listen().disable();
+  gui.add(readout, "clearance").name("Wall clearance").listen().disable();
   gui.add(readout, "scale").name("Scale").disable();
   gui.add(settings, "dockedShips", 4, 7, 1).name("Berthed ships (you're #8)").onChange(applyDockedShips);
   gui.add(settings, "spin", 0, 0.06, 0.005).name("Spin (rad/s)");
@@ -727,6 +808,44 @@ function setup(ctx: SceneContext): SceneInstance {
           inWindow: overFoot && height > -0.5 && height < 2.5,
           holdFrac: attached ? Math.min(1, holdTime / HOLD_SECONDS) : 0,
         });
+
+        // Touchdown projection on the bay wall "under" the ship — green when a
+        // settle here would be over the pad and slow, amber otherwise. Skipped
+        // near the axis, where the ship's bearing (and so "under") is undefined.
+        if (!attached && rxyLocal > 12) {
+          const inv = 1 / rxyLocal;
+          marker.position.set(
+            _local.x * inv * (BAY_R - 0.8),
+            _local.y * inv * (BAY_R - 0.8),
+            THREE.MathUtils.clamp(_local.z, BAY_BACK + 4, HUB_HALF - 4),
+          );
+          _mDir.set(-_local.x * inv, -_local.y * inv, 0);
+          marker.quaternion.setFromUnitVectors(_spinAxis, _mDir);
+          const relSpeedNow = Math.hypot(relX, relY, _relVel.z);
+          markerMat.color.set(overFoot && relSpeedNow < LAND_SPEED ? "#22c55e" : "#f59e0b");
+          marker.visible = true;
+        } else {
+          marker.visible = false;
+        }
+
+        // Parking-sensor readout: distance to the nearest bay surface.
+        const clear = Math.min(BAY_R - rxyLocal, _local.z - BAY_BACK) - SHIP_RADIUS;
+        readout.clearance = `${Math.max(0, clear).toFixed(1)} u`;
+      } else {
+        marker.visible = false;
+        readout.clearance = "—";
+      }
+
+      // Guidance holograms: entry-path dots chase toward the berth, the gate
+      // ladder pulses down onto the pad. All of it stands down once clamped.
+      guidance.visible = !attached;
+      if (guidance.visible) {
+        for (let i = 0; i < pathDots.length; i++) {
+          pathDots[i].scale.setScalar(1 + 1.4 * Math.max(0, Math.sin(elapsed * 3 - i * 0.55)));
+        }
+        for (let k = 0; k < gateMats.length; k++) {
+          gateMats[k].opacity = 0.18 + 0.5 * Math.max(0, Math.sin(elapsed * 2.5 - k * 0.8));
+        }
       }
 
       // Screen-space berth cue + capture column, hidden once clamped.
