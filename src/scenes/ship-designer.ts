@@ -936,14 +936,39 @@ function setup(ctx: SceneContext): SceneInstance {
     for (const g of geometries) g.dispose();
     hullGroup.clear();
   }
+  // Where is the shell surface REALLY, along z at (wx, wy)? The skinned SDF stern/nose is
+  // nowhere near its nominal plane: smooth-union bulges between cells stand well proud of
+  // it, and decals seated on the plane get partially swallowed (vent rings read as broken
+  // arcs). Probe the freshly built hull mesh with a small raycast fan — decal centre plus
+  // four rim points — and keep the most protruding hit, so the whole decal face clears the
+  // local surface. dir is the outward z sense of the face (+1 stern, -1 nose). Build-time
+  // only (a handful of rays per engine/weapon cell), never per-frame. Rays that miss fall
+  // back to the nominal plane.
+  const _probeRay = new THREE.Raycaster();
+  const _probeOrigin = new THREE.Vector3();
+  const _probeDir = new THREE.Vector3();
+  function probeSurfaceZ(hull: THREE.Mesh, wx: number, wy: number, nominalZ: number, dir: 1 | -1, rimR: number): number {
+    hull.updateWorldMatrix(true, false); // just added this rebuild — matrixWorld is stale
+    _probeDir.set(0, 0, -dir);
+    let best = nominalZ;
+    const offsets: [number, number][] = [[0, 0], [rimR, 0], [-rimR, 0], [0, rimR], [0, -rimR]];
+    for (const [ox, oy] of offsets) {
+      _probeOrigin.set(wx + ox, wy + oy, nominalZ + dir * 3 * CELL);
+      _probeRay.set(_probeOrigin, _probeDir);
+      const hit = _probeRay.intersectObject(hull, false)[0];
+      if (hit && (dir === 1 ? hit.point.z > best : hit.point.z < best)) best = hit.point.z;
+    }
+    return best;
+  }
+  type FacePlaneFor = (m: Module, wx: number, wy: number) => number;
   // Engine exhaust used to be a fat extruded cylinder (0.35·CELL radius, protruding
   // 0.45·CELL past the stern), which visibly clipped the shell wherever the hull surface
   // wasn't the flat plane the cylinder assumed. Now each rear-face cell wears a recessed
   // HEAT VENT: a dark plug cylinder buried almost entirely in the hull (its face a hair
-  // proud of the stern plane) with a self-glowing core disc on top. The buried body
-  // bridges however the shell curves near the plane — skinned SDF bulges included —
-  // while the 0.08 protrusion is too shallow to read as clipping from any angle.
-  function addEngineHeatVents(rearPlaneZFor: (m: Module) => number): void {
+  // proud of the LOCAL surface — per-cell, probed on curved shells) with a self-glowing
+  // core disc on top. The buried body bridges the shell however it curves; the 0.08
+  // protrusion above the probed high point is too shallow to read as clipping.
+  function addEngineHeatVents(rearPlaneZFor: FacePlaneFor): void {
     // One vent per engine footprint cell on the rear face — an XL engine (2x2 rear
     // layer) gets a 2x2 vent cluster, so the hull still reflects the propulsion layout.
     // Geometries are shared across meshes; disposeHullMeshes reclaims them via its Set.
@@ -952,9 +977,9 @@ function setup(ctx: SceneContext): SceneInstance {
     const coreGeometry = new THREE.CircleGeometry(0.26 * CELL, 20);
     for (const m of modules) {
       if (m.type !== "engine") continue;
-      const rz = rearPlaneZFor(m);
       for (let ix = m.x; ix < m.x + m.dx; ix++) {
         for (let iy = m.y; iy < m.y + m.dy; iy++) {
+          const rz = rearPlaneZFor(m, cellX(ix), cellY(iy));
           const plug = new THREE.Mesh(plugGeometry, recessMaterial);
           plug.rotation.x = Math.PI / 2; // align cylinder's y axis with +z
           plug.position.set(cellX(ix), cellY(iy), rz + 0.08 - plugLen / 2);
@@ -968,23 +993,25 @@ function setup(ctx: SceneContext): SceneInstance {
     }
   }
   // Weapon muzzles mirror the heat vents on the FRONT (-z) side: per front-face cell, a
-  // dark bore plug (mostly buried, face just shy of the front plane) plus a thin gunmetal
-  // barrel running forward to the style's tip plane. The barrel stays at 0.10·CELL radius
-  // ON PURPOSE — it must emerge through whatever shell curvature sits ahead of the plane
-  // without ever reading as the old clipped-cylinder bug; fatten it and it will.
-  function addWeaponMuzzles(frontPlaneZFor: (m: Module) => number, barrelTipZFor: (m: Module) => number): void {
+  // dark bore plug (mostly buried, face just shy of the local front surface) plus a thin
+  // gunmetal barrel running forward to the style's tip plane. The barrel stays at
+  // 0.10·CELL radius ON PURPOSE — it must emerge through whatever shell curvature sits
+  // ahead of the plane without ever reading as the old clipped-cylinder bug; fatten it
+  // and it will. barrelTipZFor receives the resolved per-cell face z, so tips track the
+  // probed surface on curved shells.
+  function addWeaponMuzzles(frontPlaneZFor: FacePlaneFor, barrelTipZFor: (m: Module, faceZ: number) => number): void {
     const boreLen = 0.5 * CELL;
     const boreGeometry = new THREE.CylinderGeometry(0.24 * CELL, 0.24 * CELL, boreLen, 16);
     for (const m of modules) {
       if (m.type !== "weapon") continue;
-      const fz = frontPlaneZFor(m);
-      const tip = barrelTipZFor(m);
-      // Barrel spans from a buried base just behind the front plane to the tip.
-      const base = fz + 0.2 * CELL;
-      const barrelLen = Math.max(0.4 * CELL, base - tip);
-      const barrelGeometry = new THREE.CylinderGeometry(0.10 * CELL, 0.10 * CELL, barrelLen, 12);
       for (let ix = m.x; ix < m.x + m.dx; ix++) {
         for (let iy = m.y; iy < m.y + m.dy; iy++) {
+          const fz = frontPlaneZFor(m, cellX(ix), cellY(iy));
+          const tip = barrelTipZFor(m, fz);
+          // Barrel spans from a buried base just behind the local face to the tip.
+          const base = fz + 0.2 * CELL;
+          const barrelLen = Math.max(0.4 * CELL, base - tip);
+          const barrelGeometry = new THREE.CylinderGeometry(0.10 * CELL, 0.10 * CELL, barrelLen, 12);
           const bore = new THREE.Mesh(boreGeometry, recessMaterial);
           bore.rotation.x = Math.PI / 2;
           bore.position.set(cellX(ix), cellY(iy), fz - 0.08 + boreLen / 2);
@@ -1044,13 +1071,22 @@ function setup(ctx: SceneContext): SceneInstance {
       cellSize: CELL,
       pad: CELL * 1.1,
     });
-    if (geo) hullGroup.add(new THREE.Mesh(geo, hullMaterial));
-    addEngineHeatVents((m) => cellZ(m.z + m.dz - 1) + CELL / 2 + skin);
+    const hullMesh = geo ? new THREE.Mesh(geo, hullMaterial) : null;
+    if (hullMesh) hullGroup.add(hullMesh);
+    // Decals seat against the PROBED local surface, not the nominal plane — the SDF
+    // stern/nose bulges between cells and swallowed plane-seated rings into broken arcs.
+    addEngineHeatVents((m, wx, wy) => {
+      const nominal = cellZ(m.z + m.dz - 1) + CELL / 2 + skin;
+      return hullMesh ? probeSurfaceZ(hullMesh, wx, wy, nominal, 1, 0.40 * CELL) : nominal;
+    });
     // Weapon front face + skin, mirroring the vents; the muzzle-clear rule guarantees an
     // empty cell ahead, so the SDF shell retreats there and the short barrel clears it.
     addWeaponMuzzles(
-      (m) => cellZ(m.z) - CELL / 2 - skin,
-      (m) => cellZ(m.z) - CELL / 2 - skin - 0.3 * CELL,
+      (m, wx, wy) => {
+        const nominal = cellZ(m.z) - CELL / 2 - skin;
+        return hullMesh ? probeSurfaceZ(hullMesh, wx, wy, nominal, -1, 0.24 * CELL) : nominal;
+      },
+      (_m, faceZ) => faceZ - 0.3 * CELL,
     );
   }
 
