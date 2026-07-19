@@ -447,9 +447,19 @@ function setup(ctx: SceneContext): SceneInstance {
   root.add(hubLight);
 
   // --- Starfield: outside the wheel, spun about Z at −ω (fog-immune so it stays
-  // visible through the skylights and hub windows). This IS the sense of spin. ---
-  const stars = buildStarfield(1200, 2400, 2600);
+  // visible through the skylights and hub windows). This IS the sense of spin.
+  // Kept CLOSE (the wheel's own extent is 965 m) with enlarged points: the first
+  // pass parked stars 1.2–2.4 km out at the default 1.4 px size — attenuation put
+  // them sub-pixel and the hub windows read as blind black discs. ---
+  const stars = buildStarfield(1100, 1700, 2600);
+  // fog=false is load-bearing (the shell sits past the 1100 m fog-far — fogged stars
+  // render as exactly the background colour). So is sizeAttenuation=false: attenuated
+  // points at these distances rasterize to nothing, which left every skylight and hub
+  // window a starless void; fixed-pixel points are also the physically right look for
+  // stars — point sources shouldn't swell as the shell wheels past.
   (stars.material as THREE.PointsMaterial).fog = false;
+  (stars.material as THREE.PointsMaterial).sizeAttenuation = false;
+  (stars.material as THREE.PointsMaterial).size = 3.5;
   const starGroup = new THREE.Group();
   starGroup.add(stars);
   root.add(starGroup);
@@ -703,13 +713,20 @@ function setup(ctx: SceneContext): SceneInstance {
   // drum within a few RGB points of the fog color and the hub read as a black void.
   const hubWallMat = trackM(new THREE.MeshStandardMaterial({ color: "#464f61", emissive: "#1d3050", emissiveIntensity: 0.55, roughness: 0.9, metalness: 0.1, side: THREE.BackSide, flatShading: true }));
   hubGroup.add(new THREE.Mesh(hubWallGeo, hubWallMat));
-  const capRingGeo = track(new THREE.RingGeometry(11, D_HUB, 64));
+  // The cap is a WINDOW, not a wall: an 8 m structural rim frame at the drum edge,
+  // with glass spanning the open annulus between the core column (radius 10) and the
+  // frame. The first build's "frame" was RingGeometry(11, 60) — an opaque bulkhead
+  // covering the whole cap, with the glass hidden behind it; no star could ever show.
+  const capRingGeo = track(new THREE.RingGeometry(52, D_HUB, 64));
   const capRingMat = trackM(new THREE.MeshStandardMaterial({ color: "#57627a", roughness: 0.8, metalness: 0.3, side: THREE.DoubleSide }));
-  const capGlassGeo = track(new THREE.CircleGeometry(D_HUB - 1, 64));
-  const capGlassMat = trackM(new THREE.MeshBasicMaterial({ color: "#0a1626", transparent: true, opacity: 0.3, side: THREE.DoubleSide, depthWrite: false }));
+  const capGlassGeo = track(new THREE.RingGeometry(11, 52.5, 64));
+  // Nearly-clear glass, INSET 0.6 m from the ring plane: at the old 0.3 opacity the
+  // already-faint stars vanished behind the tint, and glass/ring/core-end all sharing
+  // z = ±40 exactly made the whole cap one coplanar seam.
+  const capGlassMat = trackM(new THREE.MeshBasicMaterial({ color: "#0d1b30", transparent: true, opacity: 0.12, side: THREE.DoubleSide, depthWrite: false }));
   for (const z of [-LAT_HUB, LAT_HUB]) {
     const glass = new THREE.Mesh(capGlassGeo, capGlassMat);
-    glass.position.z = z;
+    glass.position.z = z - Math.sign(z) * 0.6;
     hubGroup.add(glass);
     const ringc = new THREE.Mesh(capRingGeo, capRingMat);
     ringc.position.z = z;
