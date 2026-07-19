@@ -198,7 +198,7 @@ function decalTexture(text: string, color: string): THREE.CanvasTexture {
   });
 }
 
-function padTexture(text: string, color: string): THREE.CanvasTexture {
+function padTexture(text: string, color: string, sub = "▲ HUB"): THREE.CanvasTexture {
   return makeTexture(512, 512, (g) => {
     g.clearRect(0, 0, 512, 512);
     g.fillStyle = color;
@@ -219,7 +219,7 @@ function padTexture(text: string, color: string): THREE.CanvasTexture {
     g.fillText(text, 256, 240);
     g.font = "bold 60px system-ui, sans-serif";
     g.fillStyle = color;
-    g.fillText("▲ HUB", 256, 330);
+    g.fillText(sub, 256, 330);
   });
 }
 
@@ -729,14 +729,19 @@ function setup(ctx: SceneContext): SceneInstance {
     hoop.position.z = z; // torus already lies in the XY plane, matching the drum
     hubGroup.add(hoop);
   }
-  const stripGeo = track(new THREE.BoxGeometry(1.4, 0.4, 56));
+  // Strips come as a PAIR flanking the pad zone (|lat| 8..28), not one full-width bar:
+  // a single 56 m strip ran straight through the elevator pad ring at lat 0 — the same
+  // fighting-for-the-same-real-estate mistake as the old centre-street spoke shaft.
+  const stripGeo = track(new THREE.BoxGeometry(1.4, 0.4, 20));
   for (let k = 0; k < SPOKES; k++) {
     const a = k * SPOKE_STEP;
     const stripMat = trackM(new THREE.MeshBasicMaterial({ color: SECTORS[k].color }));
-    const strip = new THREE.Mesh(stripGeo, stripMat);
     setFrame(a);
-    setBasis(strip, _negTangent, _er, _lateral, new THREE.Vector3((D_HUB - 0.6) * Math.cos(a), (D_HUB - 0.6) * Math.sin(a), 0));
-    hubGroup.add(strip);
+    for (const z of [-18, 18]) {
+      const strip = new THREE.Mesh(stripGeo, stripMat);
+      setBasis(strip, _negTangent, _er, _lateral, new THREE.Vector3((D_HUB - 0.6) * Math.cos(a), (D_HUB - 0.6) * Math.sin(a), z));
+      hubGroup.add(strip);
+    }
   }
 
   // Handrail-ish boxes + 6 hub elevator pads at the six spoke angles.
@@ -751,6 +756,13 @@ function setup(ctx: SceneContext): SceneInstance {
     hp.scale.set(5, 5, 1);
     setBasis(hp, _lateral, _tangent, _up, p);
     hubGroup.add(hp);
+    // Label inside the ring — the hub pads were anonymous, and at 0.06 g with six
+    // identical spokes you need to know which one rides down to the sector you want.
+    const hpdMat = trackM(new THREE.MeshBasicMaterial({ map: trackT(padTexture(`S${k + 1}`, "#7fe0ff", "▼ RIM")), transparent: true, depthWrite: false }));
+    const hpd = new THREE.Mesh(planeGeo, hpdMat);
+    hpd.scale.set(5, 5, 1);
+    setBasis(hpd, _lateral, _tangent, _up, new THREE.Vector3((D_HUB - 0.55) * Math.cos(theta), (D_HUB - 0.55) * Math.sin(theta), 0));
+    hubGroup.add(hpd);
     for (let z = -30; z <= 30; z += 20) {
       const rail = new THREE.Mesh(railGeo, railMat);
       setBasis(rail, _tangent, _up, _lateral, new THREE.Vector3(D_HUB * Math.cos(theta), D_HUB * Math.sin(theta), z));
